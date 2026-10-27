@@ -1,4 +1,5 @@
-*.bat text eol=crlf
+# Los .bat deben conservar CRLF tal cual (cmd de Windows): sin conversion de fin de linea
+*.bat -text
 *.txt text eol=crlf
 *.py text eol=lf
 *.png binary
