@@ -118,9 +118,22 @@ COLUMNAS_SALIDA = [
     "Fuente", "Funcionario", "Equipo",
 ]
 
+# Orden del Excel de resultados (pedido de los profesionales, 27/10/2026): primero lo
+# CONCLUYENTE (si tiene valorización, en qué folio se halló y si requiere revisión),
+# luego lo que ellos usan; el resto queda AGRUPADO y oculto (botón [+] encima de las
+# columnas). No se elimina: lo usan el histórico, "Comparar" y la trazabilidad.
+COLUMNAS_VISIBLES = [
+    "Matricula_Original", "Resultado", "Confiabilidad", "Motivos_Revision", "Estado",
+    "Matricula_Con_Anotacion", "Nivel_Matriz", "Matricula_Cancelacion", "Propietario_Gravado", "Municipio",
+    "Propietario", "Tipo_Identificacion", "Numero_Identificacion", "Propietarios_Actuales",
+    "Observaciones", "Afectaciones_Valorizacion", "Cadena_Revisada", "Folios_Revisados", "Intentos",
+    "Fuente", "Fecha_Consulta",
+]
+COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COLUMNAS_VISIBLES]
+
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.27-3"
+VERSION_APLICATIVO = "2026.10.27-4"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -771,8 +784,9 @@ fetch(url, {credentials: 'include'})
 
 
 class VURClient:
-    def __init__(self, log):
+    def __init__(self, log, notificar=lambda estado: None):
         self.log = log
+        self.notificar = notificar  # informa el estado de la sesión al semáforo de la ventana
         self.driver = None
         self.consultas = 0          # peticiones reales a VUR (cuentan para el cupo diario)
         self.consultas_cache = 0    # respuestas reutilizadas sin consultar a VUR
@@ -793,6 +807,13 @@ class VURClient:
         })
         self.driver = webdriver.Chrome(options=opciones)
         self.driver.set_script_timeout(TIMEOUT_API)
+        self.notificar("esperando")
+
+    def nueva_ejecucion(self):
+        """Al reutilizar la sesión en otro proceso: memoria y contadores desde cero
+        (los datos de VUR pueden haber cambiado desde el proceso anterior)."""
+        self._cache.clear()
+        self.consultas = self.consultas_cache = 0
 
     def cerrar_navegador(self):
         if self.driver:
@@ -801,8 +822,11 @@ class VURClient:
             except WebDriverException:
                 pass
             self.driver = None
+        self.notificar("cerrada")
 
     def vivo(self):
+        if not self.driver:
+            return False
         try:
             _ = self.driver.window_handles
             return True
@@ -830,6 +854,7 @@ class VURClient:
         """fetch() necesita estar en una página de www.vur.gov.co para enviar la sesión."""
         url = (self.driver.current_url or "").lower()
         if "siteminder" in url or "login" in url:
+            self.notificar("vencida")
             raise SesionExpirada("VUR muestra la página de inicio de sesión.")
         if "vur.gov.co" not in url:
             self.abrir_inicio()
@@ -870,13 +895,16 @@ class VURClient:
             raise ErrorVUR(f"Fallo de red: {(r or {}).get('error')}")
         destino = (r.get("url") or "").lower()
         if "siteminder" in destino or "login" in destino or "json" not in r.get("tipo", ""):
+            self.notificar("vencida")
             raise SesionExpirada("La sesión de VUR no está activa (respuesta de inicio de sesión).")
         if r["status"] != 200:
             raise ErrorVUR(f"VUR respondió HTTP {r['status']}")
         datos = json.loads(r["texto"] or "null")
         primero = datos[0] if isinstance(datos, list) and datos else datos
         if isinstance(primero, dict) and primero.get("estado") == -9999:
+            self.notificar("limite")
             raise LimiteDiario("VUR: el usuario excedió el número de peticiones por día.")
+        self.notificar("activa")
         return datos
 
     def datos_basicos(self, circulo, numero):
@@ -1029,6 +1057,33 @@ ESTILO_ESTADO = {
 }
 
 
+CONCLUSIONES = {
+    "GRAVADA": "TIENE VALORIZACIÓN VIGENTE",
+    "GRAVAMEN CANCELADO": "TUVO VALORIZACIÓN, YA CANCELADA",
+    "NO GRAVADA": "NO TIENE VALORIZACIÓN",
+    ESTADO_INCOMPLETO: "NO SE HALLÓ VALORIZACIÓN, PERO LA REVISIÓN DE MATRICES QUEDÓ INCOMPLETA",
+    "SIN DATOS EN VUR": "NO SE PUDO CONSULTAR (VUR SIN DATOS)",
+    "ERROR": "NO SE PUDO CONSULTAR (ERROR)",
+}
+
+
+def conclusion(reg):
+    """Frase concluyente de la primera columna del Excel."""
+    estado = reg.get("Estado", "")
+    texto = CONCLUSIONES.get(estado, estado or "SIN RESULTADO")
+    folio, nivel = reg.get("Matricula_Con_Anotacion"), str(reg.get("Nivel_Matriz", "")).strip()
+    if folio and estado in ("GRAVADA", "GRAVAMEN CANCELADO"):
+        texto += (" · anotación en la misma matrícula" if nivel in ("", "0")
+                  else f" · anotación en la matriz {folio} (nivel {nivel})")
+    if reg.get("Confiabilidad") == CONFIABILIDAD_REVISAR:
+        texto += " · REQUIERE REVISIÓN MANUAL"
+    return texto
+
+
+TEXTOS_LARGOS = {"Observaciones", "Cadena_Revisada", "Detalle_Valorizacion", "Notas_Proceso",
+                 "Proyectos_Municipio", "Afectaciones_Valorizacion"}
+
+
 def exportar_excel(registros, ruta):
     """Escribe el Excel de resultados con encabezado institucional.
 
@@ -1042,9 +1097,10 @@ def exportar_excel(registros, ruta):
     wb = Workbook()
     ws = wb.active
     ws.title = "Resultados"
-    ws.append(COLUMNAS_SALIDA)
+    ws.append(COLUMNAS_EXCEL)
     for reg in registros:
-        ws.append([reg.get(c, "") for c in COLUMNAS_SALIDA])
+        reg = dict(reg, Resultado=conclusion(reg))
+        ws.append([reg.get(c, "") for c in COLUMNAS_EXCEL])
     for fila in ws.iter_rows(min_row=2):
         for celda in fila:
             if isinstance(celda.value, str) and celda.value.startswith("="):
@@ -1056,23 +1112,32 @@ def exportar_excel(registros, ruta):
         celda.alignment = Alignment(vertical="center", wrap_text=True)
     anchos = {"Observaciones": 80, "Cadena_Revisada": 60, "Detalle_Valorizacion": 50,
               "Propietarios_Actuales": 45, "Propietario_Gravado": 40, "Notas_Proceso": 50,
-              "Proyectos_Municipio": 45, "Motivos_Revision": 55, "Afectaciones_Valorizacion": 60}
-    for i, col in enumerate(COLUMNAS_SALIDA, 1):
+              "Proyectos_Municipio": 45, "Motivos_Revision": 55, "Afectaciones_Valorizacion": 60,
+              "Resultado": 46, "Estado": 22, "Propietario": 28, "Municipio": 18}
+    for i, col in enumerate(COLUMNAS_EXCEL, 1):
         ws.column_dimensions[get_column_letter(i)].width = anchos.get(col, max(12, len(col) + 2))
-        if col in anchos:
-            for celda in ws.iter_cols(min_col=i, max_col=i, min_row=2):
-                for c in celda:
-                    c.alignment = Alignment(wrap_text=True, vertical="top")
+        # Los textos largos (anotaciones completas, cadena...) no se ajustan: harían filas
+        # gigantes. Se leen al seleccionar la celda o en la ventana de detalle del programa.
+        ajustar = col in anchos and col not in TEXTOS_LARGOS
+        for celda in ws.iter_cols(min_col=i, max_col=i, min_row=2):
+            for c in celda:
+                c.alignment = Alignment(wrap_text=ajustar, vertical="top")
     ws.freeze_panes = "C2"
     ws.auto_filter.ref = ws.dimensions
-    col_estado = COLUMNAS_SALIDA.index("Estado") + 1
+    col_estado = COLUMNAS_EXCEL.index("Estado") + 1
+    col_resultado = COLUMNAS_EXCEL.index("Resultado") + 1
     for fila in range(2, ws.max_row + 1):
-        celda = ws.cell(row=fila, column=col_estado)
-        estilo = ESTILO_ESTADO.get(celda.value)
+        estilo = ESTILO_ESTADO.get(ws.cell(row=fila, column=col_estado).value)
         if estilo:
-            celda.fill = PatternFill("solid", fgColor=estilo[2][1:])
-            celda.font = Font(bold=True, color=estilo[1][1:])
-    col_conf = COLUMNAS_SALIDA.index("Confiabilidad") + 1
+            for col in (col_estado, col_resultado):  # el resultado lleva el color de su estado
+                celda = ws.cell(row=fila, column=col)
+                celda.fill = PatternFill("solid", fgColor=estilo[2][1:])
+                celda.font = Font(bold=True, color=estilo[1][1:])
+    # Columnas de detalle: agrupadas y ocultas (se despliegan con el botón [+]).
+    primera = get_column_letter(len(COLUMNAS_VISIBLES) + 1)
+    ultima = get_column_letter(len(COLUMNAS_EXCEL))
+    ws.column_dimensions.group(primera, ultima, hidden=True, outline_level=1)
+    col_conf = COLUMNAS_EXCEL.index("Confiabilidad") + 1
     for fila in range(2, ws.max_row + 1):
         celda = ws.cell(row=fila, column=col_conf)
         if celda.value == CONFIABILIDAD_REVISAR:
@@ -1893,6 +1958,47 @@ class Ayuda:
             self._ventana = None
 
 
+# Estado de la sesión -> (color del punto, título, explicación)
+AVISO_INACTIVIDAD_MIN = 10  # VUR cierra la sesión por inactividad; se avisa antes
+ESTADOS_SESION = {
+    "cerrada": ("#9AA8A1", "Sin sesión", "Chrome está cerrado. Se abrirá al iniciar consultas."),
+    "esperando": ("#E0A100", "Esperando ingreso", "Inicie sesión y resuelva el captcha en Chrome."),
+    "activa": ("#018D38", "Sesión activa", "VUR está respondiendo."),
+    "inactiva": ("#E0A100", "Sesión inactiva", "Sin actividad reciente: VUR puede pedir ingresar de nuevo."),
+    "vencida": ("#B3261E", "Sesión vencida", "VUR cerró la sesión: ingrese de nuevo en Chrome."),
+    "limite": ("#B3261E", "Cupo agotado", "VUR no acepta más consultas de este usuario hoy."),
+}
+
+
+class Semaforo(tk.Frame):
+    """Indicador del estado de la sesión de VUR (punto de color + texto)."""
+
+    def __init__(self, padre, fondo, fuente, fuente_detalle):
+        super().__init__(padre, bg=fondo)
+        self._fondo = fondo
+        self._punto = tk.Canvas(self, width=20, height=20, bg=fondo, highlightthickness=0, bd=0)
+        self._punto.pack(side="left", padx=(0, 8))
+        self._img = self._punto.create_image(0, 0, anchor="nw")
+        textos = tk.Frame(self, bg=fondo)
+        textos.pack(side="left")
+        self._titulo = tk.Label(textos, bg=fondo, fg=COLOR["texto"], font=fuente, anchor="w")
+        self._titulo.pack(anchor="w")
+        self._detalle = tk.Label(textos, bg=fondo, fg=COLOR["texto_suave"], font=fuente_detalle, anchor="w")
+        self._detalle.pack(anchor="w")
+        self.estado = None
+        self.fijar("cerrada")
+
+    def fijar(self, estado, detalle=None):
+        color, titulo, explicacion = ESTADOS_SESION[estado]
+        img = imagen_cache(self, ("semaforo", color, self._fondo), lambda: pintar_en(
+            lienzo(20, 20, self._fondo), 2, 2, 16, 16, 8, mezclar(color, "#FFFFFF", 0.25), color,
+            sombra=(0.18, 0.5, 2.0), brillo=0.35))
+        self._punto.itemconfigure(self._img, image=img)
+        self.estado = estado
+        self._titulo.configure(text=f"VUR · {titulo}")
+        self._detalle.configure(text=detalle or explicacion)
+
+
 def colorear_barra_titulo(ventana, fondo="#FFFFFF", texto="#1C2723"):
     """Windows 11: pinta la barra de título del color del encabezado (en Windows 10 no hace nada)."""
     import sys
@@ -1933,6 +2039,7 @@ class App:
         self._fuentes()
         self._estilos()
         self.forzar_vur = tk.BooleanVar(value=False)
+        self._ultima_respuesta = None   # hora de la última respuesta de VUR (para el aviso de inactividad)
         self._forzar = False
         self.n_historico = 0
         self._construir_ui()
@@ -1952,6 +2059,7 @@ class App:
             self._log(f"Histórico no disponible: {type(e).__name__}: {e}")
         self.root.protocol("WM_DELETE_WINDOW", self._al_cerrar)
         self.root.after(100, self._procesar_cola)
+        self.root.after(15000, self._vigilar_sesion)
 
     # --- Apariencia ------------------------------------------------------------
 
@@ -2034,6 +2142,12 @@ class App:
                  font=self.f_titulo).pack(anchor="w")
         tk.Label(textos, text=f"{SECRETARIA}  ·  {DEPENDENCIA}", bg=c["blanco"],
                  fg=c["verde"], font=self.f_subtitulo_negrita).pack(anchor="w")
+        self.semaforo = Semaforo(cab, c["blanco"], self.f_subtitulo_negrita, self.f_pequena)
+        self.semaforo.pack(side="right", padx=(0, 28))
+        Ayuda(self.semaforo, "Estado de la sesión en VUR.\nVerde: activa. Amarillo: esperando ingreso o sin "
+                             f"actividad por más de {AVISO_INACTIVIDAD_MIN} min. Rojo: vencida o cupo diario "
+                             "agotado. Gris: Chrome cerrado.\nAl terminar un proceso, Chrome queda abierto para "
+                             "reutilizar la sesión en el siguiente sin volver a resolver el captcha.", self.f_pequena)
         tk.Frame(self.root, bg=c["verde"], height=2).pack(fill="x")  # filete institucional
 
         # Pie
@@ -2182,6 +2296,41 @@ class App:
             self._fila_marcada = (sel[0], self.tabla.item(sel[0], "tags"))
             self.tabla.item(sel[0], tags=("seleccion",))
 
+    def _notificar_sesion(self, estado):
+        """Llamado desde el hilo de consultas: el cambio se pinta en el hilo de la ventana."""
+        self.cola.put(("sesion", estado))
+
+    def _estado_sesion(self, estado):
+        if estado == "activa":
+            self._ultima_respuesta = datetime.now()
+            self.semaforo.fijar("activa", f"Última respuesta de VUR: {self._ultima_respuesta:%H:%M}")
+        else:
+            if estado in ("cerrada", "vencida", "limite"):
+                self._ultima_respuesta = None
+            self.semaforo.fijar(estado)
+
+    def _vigilar_sesion(self):
+        """Cada 15 s: avisa la inactividad y detecta si el usuario cerró Chrome (solo sin proceso en curso)."""
+        try:
+            ocupado = bool(self.hilo and self.hilo.is_alive())
+            if not ocupado and self.cliente and self.semaforo.estado != "cerrada" and not self.cliente.vivo():
+                self.cliente.driver = None
+                self._estado_sesion("cerrada")
+            elif self.semaforo.estado in ("activa", "inactiva") and self._ultima_respuesta:
+                minutos = int((datetime.now() - self._ultima_respuesta).total_seconds() // 60)
+                if minutos >= AVISO_INACTIVIDAD_MIN:
+                    self.semaforo.fijar("inactiva", f"Sin actividad hace {minutos} min: puede pedir ingresar de nuevo")
+        finally:
+            self.root.after(15000, self._vigilar_sesion)
+
+    def _obtener_cliente(self):
+        """Reutiliza el Chrome abierto (y su sesión) o prepara uno nuevo."""
+        if self.cliente and self.cliente.vivo():
+            self.cliente.nueva_ejecucion()
+            return self.cliente, self.semaforo.estado in ("activa", "inactiva")
+        self.cliente = VURClient(self.log_hilo, self._notificar_sesion)
+        return self.cliente, False
+
     def _mostrar_vista(self, indice):
         (self.vista_tabla if indice == 0 else self.vista_log).tkraise()
 
@@ -2319,6 +2468,8 @@ class App:
                 tipo, dato = self.cola.get_nowait()
                 if tipo == "log":
                     self._log(dato)
+                elif tipo == "sesion":
+                    self._estado_sesion(dato)
                 elif tipo == "progreso":
                     hechas, consultas, reutilizadas, del_historico = dato
                     total = len(self.df) if self.df is not None else 0
@@ -2502,8 +2653,11 @@ class App:
     # --- Hilo de trabajo ----------------------------------------------------
 
     def _iniciar_sesion(self, cliente):
-        self.log_hilo("Iniciando Chrome...")
-        cliente.iniciar_navegador()
+        if not cliente.vivo():
+            self.log_hilo("Iniciando Chrome...")
+            cliente.iniciar_navegador()
+        else:
+            cliente.notificar("esperando")
         cliente.abrir_inicio()
         return self._esperar_confirmacion(
             "Inicie sesión en VUR en la ventana de Chrome (incluido el captcha).\n\n"
@@ -2523,8 +2677,9 @@ class App:
             self.log_hilo(f"No se pudo guardar el parcial (¿está abierto en Excel?): {type(e).__name__}: {e}")
 
     def _flujo_consultas(self):
-        cliente = self.cliente = VURClient(self.log_hilo)
-        sesion_vur = False
+        cliente, sesion_vur = self._obtener_cliente()
+        if sesion_vur:
+            self.log_hilo("Se reutiliza la sesión de VUR abierta en Chrome.")
         self.n_historico = 0
         try:
             self.historico.cargar()  # puede haber consultas nuevas de otra ventana o funcionario
@@ -2575,7 +2730,10 @@ class App:
             self.log_hilo(f"Error general: {type(e).__name__}: {mensaje_corto(e)}")
         finally:
             self._guardar_parcial()
-            cliente.cerrar_navegador()
+            # Chrome queda abierto para reutilizar la sesión en el siguiente proceso;
+            # se cierra al cerrar la ventana del programa.
+            if not cliente.vivo():
+                cliente.cerrar_navegador()
             if self.historico.exportar_excel():
                 self.log_hilo(f"Histórico actualizado: {self.historico.archivo_excel}")
             self.cola.put(("fin", None))
@@ -2674,6 +2832,7 @@ class App:
             except SesionExpirada:
                 intentos -= 1  # la expiración de sesión no consume intentos
                 cliente.abrir_inicio()
+                cliente.notificar("vencida")
                 if not self._esperar_confirmacion("La sesión de VUR expiró. Inicie sesión de nuevo y pulse Aceptar."):
                     raise ProcesoDetenido()
             except ERRORES_RECUPERABLES as e:
@@ -2836,9 +2995,9 @@ class App:
 
     def _flujo_diagnostico(self, partes):
         """Guarda las respuestas JSON de VUR de una matrícula para revisión."""
-        cliente = self.cliente = VURClient(self.log_hilo)
+        cliente, sesion_vur = self._obtener_cliente()
         try:
-            if not self._iniciar_sesion(cliente):
+            if not sesion_vur and not self._iniciar_sesion(cliente):
                 return
             etiqueta = f"{partes[0]}-{partes[1]}"
             ruta = self.ruta_excel.with_name(f"diagnostico_{etiqueta}.json")
@@ -2851,7 +3010,8 @@ class App:
         except Exception as e:
             self.log_hilo(f"Error en diagnóstico: {type(e).__name__}: {mensaje_corto(e)}")
         finally:
-            cliente.cerrar_navegador()
+            if not cliente.vivo():
+                cliente.cerrar_navegador()
             self.cola.put(("fin", None))
 
 
@@ -3236,6 +3396,36 @@ def ejecutar_autopruebas():
                 finally:
                     v.ARCHIVO_CONFIG, v.CARPETA_CONSULTAS, v.CARPETA_HISTORICO = config_original, consultas, historico
 
+
+    class ExcelConcluyente(unittest.TestCase):
+        """Pedido de los profesionales (27/10/2026): las primeras columnas deben ser concluyentes."""
+
+        def test_conclusion(self):
+            self.assertEqual(v.conclusion({"Estado": "NO GRAVADA", "Confiabilidad": "ALTA"}), "NO TIENE VALORIZACIÓN")
+            t = v.conclusion({"Estado": "GRAVAMEN CANCELADO", "Matricula_Con_Anotacion": "01N-5052127",
+                              "Nivel_Matriz": 3, "Confiabilidad": "REVISAR"})
+            self.assertEqual(t, "TUVO VALORIZACIÓN, YA CANCELADA · anotación en la matriz 01N-5052127 (nivel 3)"
+                                " · REQUIERE REVISIÓN MANUAL")
+            self.assertIn("misma matrícula", v.conclusion({"Estado": "GRAVADA", "Matricula_Con_Anotacion": "008-1",
+                                                            "Nivel_Matriz": 0}))
+
+        def test_orden_y_columnas_agrupadas(self):
+            import tempfile
+            import openpyxl
+            with tempfile.TemporaryDirectory() as d:
+                ruta = Path(d) / "r.xlsx"
+                v.exportar_excel([dict(Matricula_Original="MI 008-1", Matricula_Limpia="008-1", Estado="GRAVADA",
+                                       Confiabilidad="ALTA")], ruta)
+                wb = openpyxl.load_workbook(ruta)
+                ws = wb["Resultados"]
+                encabezado = [c.value for c in ws[1]]
+                self.assertEqual(encabezado[:3], ["Matricula_Original", "Resultado", "Confiabilidad"])
+                self.assertEqual(ws["B2"].value, "TIENE VALORIZACIÓN VIGENTE")
+                self.assertEqual(set(encabezado) - {"Resultado"}, set(v.COLUMNAS_SALIDA))  # no se pierde ninguna
+                oculta = openpyxl.utils.get_column_letter(len(v.COLUMNAS_VISIBLES) + 1)
+                self.assertTrue(any(dim.hidden and dim.min <= openpyxl.utils.column_index_from_string(oculta) <= dim.max
+                                    for dim in ws.column_dimensions.values()))
+                wb.close()
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
