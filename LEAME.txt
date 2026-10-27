@@ -1,0 +1,32 @@
+CONSULTA DE VALORIZACION EN VUR - Gobernacion de Antioquia
+Secretaria de Infraestructura - Direccion Administrativa y Financiera
+
+COMO SE USA
+  1. Doble clic en "Iniciar VUR.bat" (o en el acceso directo "Consulta VUR" del Escritorio).
+  2. Paso 1: seleccione el Excel de matriculas (se guardan en la carpeta "consultas").
+  3. Paso 2: "Iniciar consultas". Inicie sesion en VUR y resuelva el captcha.
+  4. Paso 3: "Guardar Excel". Durante la consulta se guarda ademas un parcial automatico
+     junto al Excel de matriculas.
+
+QUE HAY EN ESTA CARPETA
+  Iniciar VUR.bat            Abre el programa.
+  Crear acceso directo.bat   Crea el acceso directo en el Escritorio (una vez).
+  Guardar clave de VUR.bat   Abre Chrome normal para que guarde la contrasena (una vez).
+  consultas\                 Excel de matriculas y resultados. Aqui trabaja usted.
+  datos\                     Excel de proyectos de valorizacion por municipio.
+  programa\                  Codigo y recursos del programa. No modificar a mano.
+     selenium_profile\       Perfil de Chrome del programa (sesion y clave guardada).
+     Probar reglas.bat       Pruebas automaticas; usar despues de cambiar el codigo.
+  respaldos\                 Versiones antiguas y diagnosticos tecnicos.
+  historico\                 Consultas anteriores (se crea sola con la primera consulta).
+     registros\              Un archivo por cada proceso de consulta. No borrar ni editar.
+     Historico_consultas.xlsx Ultimo resultado de cada matricula (solo para leer).
+
+SI CAMBIA EL EXCEL DE PROYECTOS
+  Reemplace el archivo en "datos" y ejecute en la carpeta "programa":
+     py generar_datos_valorizacion.py
+
+HISTORICO DE CONSULTAS
+  Antes de consultar VUR, el programa revisa el historico. Si la matricula se consulto hace
+  menos de 30 dias con confiabilidad ALTA, toma ese resultado (columna Fuente = Historico)
+  y no gasta cupo de VUR. Para consultar todo en VUR marque "Forzar consulta en VUR".

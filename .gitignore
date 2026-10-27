@@ -1,0 +1,17 @@
+# Datos personales y de sesion: NUNCA subir al repositorio
+programa/selenium_profile/
+selenium_profile/
+consultas/
+historico/
+datos/
+respaldos/
+*.xlsx
+*.xls
+*.json
+*.jsonl
+diagnostico_*
+
+# Temporales
+__pycache__/
+*.pyc
+~$*
