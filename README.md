@@ -6,6 +6,24 @@ valorización. Revisa en la Ventanilla Única de Registro (VUR) el folio y sus m
 **Gobernación de Antioquia** · Secretaría de Infraestructura · Dirección Administrativa y Financiera
 Desarrollado por Alexander Gómez A. · Versión BETA
 
+## Instalación en un equipo nuevo (pruebas BETA)
+
+1. Descargue el instalador: [Instalar_VUR.bat](https://github.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/raw/main/Instalar_VUR.bat).
+   Si el navegador lo abre como texto, use clic derecho → «Guardar enlace como…».
+2. Haga doble clic en `Instalar_VUR.bat`. Si Windows muestra «Windows protegió su PC», pulse
+   **Más información** → **Ejecutar de todas formas**; el aviso sale porque el archivo viene de internet.
+3. El instalador:
+   1. pregunta en qué carpeta instalar;
+   2. descarga el programa;
+   3. instala Python (si falta) y las librerías;
+   4. crea las carpetas `consultas`, `datos`, `historico` y `respaldos`;
+   5. crea el acceso directo «Consulta VUR» en el Escritorio;
+   6. ejecuta las pruebas automáticas.
+4. Para **actualizar**, ejecute de nuevo el instalador y responda «S». No borra consultas ni histórico,
+   y guarda la versión anterior en `respaldos`.
+
+Requiere Windows 10 u 11, Google Chrome, conexión a internet y permiso para ejecutar PowerShell.
+
 ## Cómo se usa
 
 1. Doble clic en `Iniciar VUR.bat`. La primera vez instala las librerías que faltan.

@@ -111,7 +111,7 @@ COLUMNAS_SALIDA = [
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.26-5"
+VERSION_APLICATIVO = "2026.10.27-1"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -927,6 +927,58 @@ CARPETA_CONSULTAS = (CARPETA_RAIZ / "consultas" if CARPETA_RAIZ != CARPETA_APP a
 # (carpeta de red o nube) basta con definir la variable de entorno VUR_HISTORICO con
 # la nueva ruta, sin cambiar el código.
 CARPETA_HISTORICO = Path(os.environ["VUR_HISTORICO"]) if os.environ.get("VUR_HISTORICO") else CARPETA_RAIZ / "historico"
+
+# Carpeta de trabajo de cada usuario (consultas, histórico, datos, respaldos). Se elige
+# la primera vez que se abre el programa (o la elige el instalador) y se guarda en
+# %APPDATA%\VUR_Valorizacion\config.json; desde entonces es la carpeta del aplicativo.
+ARCHIVO_CONFIG = Path(os.environ.get("APPDATA") or Path.home()) / "VUR_Valorizacion" / "config.json"
+SUBCARPETAS_TRABAJO = ("consultas", "datos", "historico", "respaldos")
+
+
+def leer_carpeta_trabajo():
+    try:
+        carpeta = json.loads(ARCHIVO_CONFIG.read_text(encoding="utf-8-sig")).get("carpeta")  # el instalador escribe con BOM
+        return Path(carpeta) if carpeta else None
+    except (OSError, ValueError):
+        return None
+
+
+def aplicar_carpeta_trabajo(carpeta, guardar=False):
+    """Crea las subcarpetas, (opcional) guarda la elección y la usa desde ese momento."""
+    global CARPETA_CONSULTAS, CARPETA_HISTORICO
+    carpeta = Path(carpeta)
+    for sub in SUBCARPETAS_TRABAJO:
+        (carpeta / sub).mkdir(parents=True, exist_ok=True)
+    if guardar:
+        ARCHIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        ARCHIVO_CONFIG.write_text(json.dumps({"carpeta": str(carpeta), "elegida": f"{datetime.now():%Y-%m-%d %H:%M}",
+                                              "version": VERSION_APLICATIVO}, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+    CARPETA_CONSULTAS = carpeta / "consultas"
+    if not os.environ.get("VUR_HISTORICO"):
+        CARPETA_HISTORICO = carpeta / "historico"
+    return carpeta
+
+
+def primer_inicio(raiz):
+    """Primera vez en este usuario de Windows: pide la carpeta de trabajo y la crea."""
+    carpeta = leer_carpeta_trabajo()
+    if carpeta and carpeta.is_dir():
+        return aplicar_carpeta_trabajo(carpeta)
+    messagebox.showinfo(
+        "Bienvenido", "Es la primera vez que abre el programa en este usuario.\n\n"
+        "Elija la carpeta donde quiere trabajar. Allí se crearán:\n"
+        "  consultas  (Excel de matrículas y resultados)\n  historico  (consultas anteriores)\n"
+        "  datos  y  respaldos\n\nSi no elige ninguna, se usará la carpeta del programa:\n"
+        f"{CARPETA_RAIZ}", parent=raiz)
+    elegida = filedialog.askdirectory(title="Carpeta de trabajo del aplicativo VUR", initialdir=str(CARPETA_RAIZ),
+                                      mustexist=False, parent=raiz)
+    try:
+        return aplicar_carpeta_trabajo(Path(elegida) if elegida else CARPETA_RAIZ, guardar=True)
+    except OSError as e:
+        messagebox.showwarning("Carpeta de trabajo", f"No se pudo usar esa carpeta ({type(e).__name__}: {e}).\n"
+                               f"Se usará {CARPETA_RAIZ}.", parent=raiz)
+        return aplicar_carpeta_trabajo(CARPETA_RAIZ, guardar=True)
 CARPETA_FUENTES = CARPETA_APP / "fuentes"  # Poppins (licencia SIL OFL 1.1, ver OFL-Poppins.txt)
 
 
@@ -1274,7 +1326,7 @@ def _usuario_equipo():
 
 class Historico:
     def __init__(self, carpeta=None, log=lambda m: None):
-        self.carpeta = Path(carpeta or CARPETA_HISTORICO)
+        self.carpeta = Path(carpeta or CARPETA_HISTORICO)  # se lee al crear: respeta la carpeta de trabajo
         self.dir_registros = self.carpeta / "registros"
         self.archivo_excel = self.carpeta / "Historico_consultas.xlsx"
         self.log = log
@@ -2813,5 +2865,8 @@ class App:
 if __name__ == "__main__":
     cargar_fuentes_privadas()
     raiz = tk.Tk()
+    raiz.withdraw()           # la ventana principal aparece después de elegir la carpeta
+    primer_inicio(raiz)
+    raiz.deiconify()
     App(raiz)
     raiz.mainloop()

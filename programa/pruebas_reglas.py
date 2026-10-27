@@ -367,6 +367,24 @@ class HistoricoConsultas(unittest.TestCase):
         self.assertEqual(h.buscar("008-1")["Estado"], "NO GRAVADA")
 
 
+class CarpetaTrabajo(unittest.TestCase):
+    def test_crea_subcarpetas_y_guarda_eleccion(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            config_original = v.ARCHIVO_CONFIG
+            consultas, historico = v.CARPETA_CONSULTAS, v.CARPETA_HISTORICO
+            try:
+                v.ARCHIVO_CONFIG = Path(d) / "appdata" / "VUR_Valorizacion" / "config.json"
+                destino = Path(d) / "Mi carpeta VUR"
+                v.aplicar_carpeta_trabajo(destino, guardar=True)
+                for sub in v.SUBCARPETAS_TRABAJO:
+                    self.assertTrue((destino / sub).is_dir())
+                self.assertEqual(v.leer_carpeta_trabajo(), destino)
+                self.assertEqual(v.CARPETA_CONSULTAS, destino / "consultas")
+            finally:
+                v.ARCHIVO_CONFIG, v.CARPETA_CONSULTAS, v.CARPETA_HISTORICO = config_original, consultas, historico
+
+
 if __name__ == "__main__":
     resultado = unittest.main(exit=False, verbosity=2).result
     print("\n" + ("TODAS LAS PRUEBAS PASARON" if resultado.wasSuccessful()
