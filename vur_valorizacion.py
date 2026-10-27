@@ -120,7 +120,7 @@ COLUMNAS_SALIDA = [
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.27-2"
+VERSION_APLICATIVO = "2026.10.27-3"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1146,8 +1146,10 @@ CAMPOS_COMPARADOS = [  # (columna, nombre para el usuario)
 
 def _leer_resultados(ruta):
     """Lee la hoja 'Resultados' (o la primera) de un Excel generado por el programa."""
-    hojas = pd.ExcelFile(ruta).sheet_names
-    df = pd.read_excel(ruta, sheet_name="Resultados" if "Resultados" in hojas else 0, dtype=str).fillna("")
+    # "with" cierra el archivo al terminar: en Windows un Excel abierto queda bloqueado para otros programas.
+    with pd.ExcelFile(ruta) as libro:
+        hoja = "Resultados" if "Resultados" in libro.sheet_names else 0
+        df = pd.read_excel(libro, sheet_name=hoja, dtype=str).fillna("")
     if "Matricula_Limpia" not in df.columns:
         raise ValueError(f"{Path(ruta).name} no parece un Excel de resultados del programa "
                          "(no tiene la columna Matricula_Limpia).")
@@ -5451,8 +5453,39 @@ MUNICIPIOS_VALORIZACION = {'ABEJORRAL': {'cod_mpio': '002',
 # ==== FIN DATOS DE PROYECTOS ====
 
 
+def registrar_error_inicio():
+    """Guarda el error de arranque en un archivo y lo muestra (con pythonw no hay consola donde verlo)."""
+    import traceback
+    detalle = traceback.format_exc()
+    ruta = CARPETA_USUARIO / "error_inicio.txt"
+    try:
+        CARPETA_USUARIO.mkdir(parents=True, exist_ok=True)
+        ruta.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S} · versión {VERSION_APLICATIVO}\n\n{detalle}", encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        aviso = tk.Tk()
+        aviso.withdraw()
+        messagebox.showerror("Consulta VUR", "El programa no pudo iniciar.\n\n"
+                             f"{detalle.strip().splitlines()[-1]}\n\nEl detalle quedó en:\n{ruta}\n"
+                             "Envíe ese archivo al desarrollador.", parent=aviso)
+        aviso.destroy()
+    except Exception:  # noqa: BLE001 - si ni siquiera Tk abre, queda el archivo
+        pass
+
+
 def principal():
     import sys
+    try:
+        _principal(sys)
+    except SystemExit:
+        raise
+    except BaseException:
+        registrar_error_inicio()
+        raise
+
+
+def _principal(sys):
     if "--probar" in sys.argv:
         sys.exit(0 if ejecutar_autopruebas() else 1)
     if "--recursos" in sys.argv:
