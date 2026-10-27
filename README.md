@@ -6,61 +6,62 @@ valorización. Revisa en la Ventanilla Única de Registro (VUR) el folio y sus m
 **Gobernación de Antioquia** · Secretaría de Infraestructura · Dirección Administrativa y Financiera
 Desarrollado por Alexander Gómez A. · Versión BETA
 
-## Instalación en un equipo nuevo (pruebas BETA)
+## Instalación
 
-1. Descargue el instalador: [Instalar_VUR.bat](https://github.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/raw/main/Instalar_VUR.bat).
-   Si el navegador lo abre como texto, use clic derecho → «Guardar enlace como…».
-2. Haga doble clic en `Instalar_VUR.bat`. Si Windows muestra «Windows protegió su PC», pulse
-   **Más información** → **Ejecutar de todas formas**; el aviso sale porque el archivo viene de internet.
-3. El instalador:
+1. Descargue el ZIP: [VUR_AUTOMATIZACION_GOBANT-main.zip](https://github.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/archive/refs/heads/main.zip).
+   También puede usar el botón verde **Code → Download ZIP**.
+2. Clic derecho sobre el ZIP → **Extraer todo**.
+3. En la carpeta extraída, doble clic en **`Instalar_VUR.bat`**. Si Windows muestra «Windows protegió su PC»,
+   pulse **Más información → Ejecutar de todas formas**.
+4. Siga las instrucciones en pantalla. El instalador:
    1. pregunta en qué carpeta instalar;
-   2. descarga el programa;
-   3. instala Python (si falta) y las librerías;
-   4. crea las carpetas `consultas`, `datos`, `historico` y `respaldos`;
-   5. crea el acceso directo «Consulta VUR» en el Escritorio;
-   6. ejecuta las pruebas automáticas.
-4. Para **actualizar**, ejecute de nuevo el instalador y responda «S». No borra consultas ni histórico,
-   y guarda la versión anterior en `respaldos`.
+   2. instala Python, si falta, y las librerías;
+   3. copia el programa;
+   4. crea las carpetas de trabajo y el acceso directo **«Consulta VUR»** en el Escritorio;
+   5. ejecuta las pruebas automáticas.
+5. Al terminar puede borrar el ZIP y la carpeta extraída.
 
-Requiere Windows 10 u 11, Google Chrome, conexión a internet y permiso para ejecutar PowerShell.
+**Actualizar:** descargue el ZIP nuevo y ejecute otra vez `Instalar_VUR.bat`. No borra consultas
+ni histórico, y guarda la versión anterior en `respaldos`.
 
-## Cómo se usa
+**Requisitos:** Windows 10 u 11, Google Chrome, internet, permiso para ejecutar PowerShell y un
+usuario propio de VUR.
 
-1. Doble clic en `Iniciar VUR.bat`. La primera vez instala las librerías que faltan.
-2. Paso 1: seleccionar el Excel con la columna de matrículas.
-3. Paso 2: «Iniciar consultas». El funcionario inicia sesión en VUR y resuelve el captcha.
-4. Paso 3: «Guardar Excel». El archivo trae las hojas «Resultados» y «Resumen».
+## Uso
 
-Detalle de la carpeta y del histórico de consultas: ver `LEAME.txt`.
+1. Paso 1: **Seleccionar Excel** con la columna de matrículas (por ejemplo `001-123456`).
+2. Paso 2: **Iniciar consultas**. Se abre Chrome; usted inicia sesión en VUR y resuelve el captcha.
+3. Paso 3: **Guardar Excel**. El archivo trae las hojas «Resultados» y «Resumen». Con **Comparar** se
+   ve qué cambió entre dos consultas del mismo lote.
 
-## Requisitos
+Antes de consultar VUR, el programa revisa el **histórico**. Si una matrícula se consultó hace menos
+de 30 días con confiabilidad ALTA, toma ese resultado (columna *Fuente* = Histórico) y no gasta
+cupo de VUR. Para consultarla de nuevo, marque **«Forzar consulta en VUR»**.
 
-- Windows 10 u 11, Google Chrome y Python 3.10 o superior.
-- Librerías: `selenium`, `pandas`, `openpyxl` (y `xlrd` para archivos .xls).
+## Carpetas en el equipo
 
-## Estructura
-
-| Ruta | Contenido |
+| Carpeta | Contenido |
 |---|---|
-| `programa/vur_valorizacion.py` | Aplicativo: interfaz, consulta a VUR, reglas de análisis, histórico |
-| `programa/datos_valorizacion.py` | Proyectos por municipio (generado; no editar a mano) |
-| `programa/generar_datos_valorizacion.py` | Regenera el archivo anterior desde el Excel de proyectos |
-| `programa/pruebas_reglas.py` | Pruebas automáticas (`Probar reglas.bat`) |
-| `programa/fuentes/` | Tipografía Poppins (licencia SIL OFL 1.1) |
-| `*.bat` | Abrir el programa, crear el acceso directo, guardar la clave en Chrome |
+| `VUR_valorizacion\vur_valorizacion.py` | El aplicativo completo |
+| `consultas\` | Excel de matrículas, resultados y comparaciones |
+| `historico\` | Consultas anteriores. `registros\` no se edita; `Historico_consultas.xlsx` es para leer |
+| `datos\`, `respaldos\` | Excel de proyectos (solo el desarrollador) y versiones anteriores |
+| `%LOCALAPPDATA%\VUR_Valorizacion\` | Perfil de Chrome del programa y recursos (logo, icono, fuentes) |
 
-## Lo que NO se sube a este repositorio
+## Repositorio
 
-El archivo `.gitignore` excluye todo lo que contiene datos personales o de sesión:
+| Archivo | Para qué |
+|---|---|
+| `Instalar_VUR.bat` | Instalador: lo único que usan los profesionales |
+| `vur_valorizacion.py` | Todo el aplicativo: código, datos de proyectos por municipio, logo, icono, tipografía Poppins (SIL OFL 1.1) y pruebas |
+| `desarrollo/generar_datos_valorizacion.py` | Actualiza los datos de proyectos dentro del aplicativo cuando cambia el Excel |
 
-- los Excel de consultas y resultados;
-- el histórico;
-- el Excel de proyectos;
-- el perfil de Chrome (`selenium_profile`, que guarda la sesión y la clave de VUR).
+**Datos personales:** el archivo `.gitignore` impide subir Excel de consultas, el histórico o el perfil
+de Chrome, porque contienen datos protegidos por la Ley 1581 de 2012.
 
-Estos datos están protegidos por la Ley 1581 de 2012 y deben quedarse en el equipo o en la carpeta
-autorizada.
+### Para el desarrollador
 
-## Después de cualquier cambio al código
-
-Ejecutar `programa/Probar reglas.bat`. Todas las pruebas deben pasar antes de usar el programa.
+```
+python vur_valorizacion.py --probar        # pruebas automáticas: todas deben pasar
+python desarrollo/generar_datos_valorizacion.py "ruta\INFORMACION PROYECTOS DE VALORIZACION (1).xlsx"
+```

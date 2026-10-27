@@ -1,12 +1,15 @@
 """
-Genera datos_valorizacion.py a partir de INFORMACION PROYECTOS DE VALORIZACION.xlsx.
+Actualiza los DATOS DE PROYECTOS que van dentro de vur_valorizacion.py a partir
+del Excel INFORMACION PROYECTOS DE VALORIZACION.xlsx.
 
-Uso (solo cuando cambie el Excel):
-    python generar_datos_valorizacion.py "INFORMACION PROYECTOS DE VALORIZACION (1).xlsx"
+Uso (solo cuando cambie el Excel; lo usa el desarrollador, no los profesionales):
+    python desarrollo/generar_datos_valorizacion.py "ruta\\INFORMACION PROYECTOS DE VALORIZACION (1).xlsx"
 
 Hojas leídas: "Proy x Mpio", "Proyectos Valorización" y "Vencimiento".
-El resultado queda junto a este script y vur_valorizacion.py lo importa, así
-no se abre el Excel en cada consulta.
+Reemplaza el bloque entre "# ==== INICIO DATOS DE PROYECTOS ====" y
+"# ==== FIN DATOS DE PROYECTOS ====" de vur_valorizacion.py (guarda antes una
+copia .bak) y comprueba que el programa resultante compile. Después hay que
+ejecutar las pruebas: python vur_valorizacion.py --probar
 """
 import datetime
 import pprint
@@ -84,18 +87,25 @@ for r in wb['Proy x Mpio'].iter_rows(min_row=3, values_only=True):
         projs.append(info)
     municipios[mun] = {"cod_mpio": cod(r[0]), "estado": estado, "proyectos": projs, "nota": nota, "texto_hoja": texto}
 
-salida = Path(__file__).with_name("datos_valorizacion.py")
-encabezado = (
-    '"""Datos de valorización generados automáticamente. No editar a mano.\n\n'
-    f"Fuente: {Path(RUTA).name}\n"
-    f"Generado: {datetime.datetime.now():%Y-%m-%d %H:%M}\n"
-    "Regenerar con: python generar_datos_valorizacion.py <ruta del Excel>\n\n"
-    "estado: '000' no gravado | '001' tiene proyectos | 'NO_APLICA' | 'CONDONADA'\n"
-    '"""\n\n'
+programa = _aqui.parent / "vur_valorizacion.py"
+INICIO, FIN = "# ==== INICIO DATOS DE PROYECTOS ====", "# ==== FIN DATOS DE PROYECTOS ===="
+texto = programa.read_text(encoding="utf-8")
+if texto.count(INICIO) != 1 or texto.count(FIN) != 1:
+    sys.exit(f"No se encontraron las marcas de DATOS DE PROYECTOS en {programa}")
+bloque = (
+    f"{INICIO}\n"
+    "# Generado por desarrollo/generar_datos_valorizacion.py a partir del Excel de proyectos\n"
+    "# (hoja 'Proy x Mpio'). No editar a mano: regenerar con ese programa.\n"
+    f"# Fuente: {Path(RUTA).name} · generado {datetime.datetime.now():%Y-%m-%d %H:%M}\n"
+    "# estado: '000' no gravado | '001' tiene proyectos | 'NO_APLICA' | 'CONDONADA'\n\n"
     f"FUENTE_DATOS = {Path(RUTA).name!r}\n\n"
+    "MUNICIPIOS_VALORIZACION = " + pprint.pformat(municipios, width=110, sort_dicts=True) + f"\n{FIN}"
 )
-salida.write_text(encabezado + "MUNICIPIOS_VALORIZACION = " + pprint.pformat(municipios, width=110, sort_dicts=True) + "\n", encoding="utf-8")
+nuevo = texto[:texto.index(INICIO)] + bloque + texto[texto.index(FIN) + len(FIN):]
+compile(nuevo, str(programa), "exec")  # si el resultado no es Python válido, no se escribe nada
+programa.with_suffix(".py.bak").write_text(texto, encoding="utf-8")
+programa.write_text(nuevo, encoding="utf-8")
+print(f"{len(municipios)} municipios actualizados en {programa} (copia anterior: {programa.name}.bak)")
 sin_anio = [(k, p["codigo"], p["obra"]) for k, m in municipios.items() for p in m["proyectos"] if "anio" not in p]
-print(f"{len(municipios)} municipios escritos en {salida}")
 for k, c, o in sin_anio:
     print(f"  Aviso: {k}: proyecto {c} {o} sin año en la hoja 'Proyectos Valorización'")

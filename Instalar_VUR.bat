@@ -3,14 +3,16 @@ REM ================================================================
 REM  INSTALADOR - Consulta de valorizacion en VUR (version BETA)
 REM  Gobernacion de Antioquia - Secretaria de Infraestructura
 REM
-REM  Un solo archivo: descarguelo y haga doble clic. El instalador
-REM  pregunta en que carpeta instalar, descarga el programa desde
-REM  GitHub, instala Python y las librerias si faltan, crea las
-REM  carpetas de trabajo y el acceso directo del Escritorio.
-REM  Ejecutarlo de nuevo ACTUALIZA el programa sin borrar consultas.
+REM  1. Descargue el ZIP del repositorio y extraigalo (clic derecho >
+REM     "Extraer todo").
+REM  2. Haga doble clic en este archivo.
+REM  El instalador pregunta la carpeta, instala Python y las librerias
+REM  si faltan, copia el programa, crea las carpetas de trabajo y el
+REM  acceso directo. Ejecutarlo de nuevo ACTUALIZA sin borrar datos.
 REM ================================================================
 setlocal
 title Instalador VUR - Gobernacion de Antioquia
+set "VUR_ORIGEN=%~dp0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText('%~f0'); $m='#==INICIO'+'_POWERSHELL=='; iex $t.Substring($t.IndexOf($m)+$m.Length)"
 echo.
 pause
@@ -19,9 +21,12 @@ exit /b
 #==INICIO_POWERSHELL==
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$Zip = 'https://github.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/archive/refs/heads/main.zip'
+$UrlPrograma = 'https://github.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/raw/main/vur_valorizacion.py'
+$Librerias = @('selenium>=4.11', 'pandas>=2.0', 'openpyxl>=3.1', 'xlrd>=2.0')
 $CfgDir = Join-Path $env:APPDATA 'VUR_Valorizacion'
 $Cfg = Join-Path $CfgDir 'config.json'
+$Usuario = Join-Path $env:LOCALAPPDATA 'VUR_Valorizacion'
+$Fecha = Get-Date -Format 'yyyyMMdd_HHmm'
 
 function Paso($n, $texto) { Write-Host ''; Write-Host " [$n/7] $texto" -ForegroundColor Green }
 function Aviso($texto) { Write-Host "       $texto" -ForegroundColor Yellow }
@@ -41,7 +46,7 @@ if (Test-Path $Cfg) {
     try { $anterior = (Get-Content $Cfg -Raw | ConvertFrom-Json).carpeta } catch { $anterior = $null }
 }
 $destino = $null
-if ($anterior -and (Test-Path (Join-Path $anterior 'programa'))) {
+if ($anterior -and (Test-Path $anterior)) {
     Write-Host "       Ya esta instalado en: $anterior"
     $r = Read-Host '       Actualizar esa instalacion? (S = si, N = elegir otra carpeta)'
     if ($r -notmatch '^[nN]') { $destino = $anterior }
@@ -56,14 +61,17 @@ if (-not $destino) {
     $dlg.ShowNewFolderButton = $true
     if ($dlg.ShowDialog($dueno) -ne [System.Windows.Forms.DialogResult]::OK) { Falla 'Instalacion cancelada: no se eligio carpeta.' }
     $base = $dlg.SelectedPath
-    if ((Split-Path $base -Leaf) -match '^vur_valorizacion$' -or (Test-Path (Join-Path $base 'programa'))) {
+    if ((Split-Path $base -Leaf) -match '^vur_valorizacion$' -or (Test-Path (Join-Path $base 'vur_valorizacion.py')) -or
+        (Test-Path (Join-Path $base 'programa\vur_valorizacion.py'))) {
         $destino = $base
     } else {
         $destino = Join-Path $base 'VUR_valorizacion'
     }
 }
 Write-Host "       Carpeta: $destino"
-New-Item -ItemType Directory -Force -Path $destino | Out-Null
+foreach ($sub in @('', 'consultas', 'datos', 'historico', 'respaldos')) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $destino $sub) | Out-Null
+}
 
 # ---- 2. Python ----------------------------------------------------------------
 Paso 2 'Python'
@@ -93,35 +101,51 @@ if (-not $py) {
 }
 Write-Host "       Python listo: $(& $py --version)"
 
-# ---- 3. Descargar el programa ---------------------------------------------------
-Paso 3 'Descargando el programa desde GitHub'
-$tmp = Join-Path $env:TEMP ('vur_instalador_' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-try {
-    Invoke-WebRequest -UseBasicParsing -Uri $Zip -OutFile (Join-Path $tmp 'vur.zip')
-} catch { Falla "No se pudo descargar el programa: $($_.Exception.Message). Revise internet o el proxy de la entidad." }
-Expand-Archive -Path (Join-Path $tmp 'vur.zip') -DestinationPath $tmp -Force
-$origen = Get-ChildItem $tmp -Directory | Select-Object -First 1
+# ---- 3. Programa ------------------------------------------------------------------
+Paso 3 'Programa'
+$nuevo = Join-Path $env:VUR_ORIGEN 'vur_valorizacion.py'
+if (Test-Path $nuevo) {
+    Write-Host '       Se usa vur_valorizacion.py del ZIP descargado.'
+} else {
+    Aviso 'No se encontro vur_valorizacion.py junto al instalador (el ZIP no se extrajo); se descarga de GitHub.'
+    $nuevo = Join-Path $env:TEMP 'vur_valorizacion_descargado.py'
+    try { Invoke-WebRequest -UseBasicParsing -Uri $UrlPrograma -OutFile $nuevo }
+    catch { Falla "No se pudo descargar el programa: $($_.Exception.Message). Extraiga el ZIP completo y ejecute el instalador desde esa carpeta." }
+}
 
-# ---- 4. Copiar (respaldando la version anterior) --------------------------------
+# ---- 4. Instalar (respaldando lo anterior) ------------------------------------------
 Paso 4 'Instalando archivos'
-foreach ($sub in @('consultas', 'datos', 'historico', 'respaldos', 'programa')) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $destino $sub) | Out-Null
+$respaldo = Join-Path $destino "respaldos\version_anterior_$Fecha"
+$actual = Join-Path $destino 'vur_valorizacion.py'
+if ((Test-Path $actual) -and ((Resolve-Path $actual).Path -ne (Resolve-Path $nuevo).Path)) {
+    New-Item -ItemType Directory -Force -Path $respaldo | Out-Null
+    Copy-Item $actual $respaldo -Force
 }
-$viejo = Join-Path $destino 'programa\vur_valorizacion.py'
+# Versiones anteriores (carpeta "programa" y varios .bat): el perfil de Chrome pasa a la carpeta
+# del usuario y lo demas se mueve a respaldos. No se borra nada.
+$viejo = Join-Path $destino 'programa'
 if (Test-Path $viejo) {
-    $copia = Join-Path $destino ('respaldos\vur_valorizacion_' + (Get-Date -Format 'yyyyMMdd_HHmm') + '.py')
-    Copy-Item $viejo $copia -Force
-    Write-Host "       Version anterior respaldada en respaldos\"
+    $perfilViejo = Join-Path $viejo 'selenium_profile'
+    $perfilNuevo = Join-Path $Usuario 'perfil_chrome'
+    if ((Test-Path $perfilViejo) -and -not (Test-Path $perfilNuevo)) {
+        New-Item -ItemType Directory -Force -Path $Usuario | Out-Null
+        try { Move-Item $perfilViejo $perfilNuevo } catch { Aviso 'No se pudo mover el perfil de Chrome (cierre Chrome y el programa VUR y repita).' }
+    }
+    New-Item -ItemType Directory -Force -Path $respaldo | Out-Null
+    Move-Item $viejo (Join-Path $respaldo 'programa') -Force
 }
-# Solo se copian archivos del programa: consultas, historico y el perfil de Chrome no se tocan.
-Get-ChildItem $origen.FullName -Force | Where-Object { $_.Name -notin @('.gitignore', '.gitattributes', '.github') } |
-    ForEach-Object { Copy-Item $_.FullName -Destination $destino -Recurse -Force }
-Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($f in @('Iniciar VUR.bat', 'Crear acceso directo.bat', 'Guardar clave de VUR.bat', 'Organizar carpeta.bat',
+                 'Descargar manual de identidad.bat', 'LEAME.txt', 'requirements.txt')) {
+    $p = Join-Path $destino $f
+    if (Test-Path $p) { New-Item -ItemType Directory -Force -Path $respaldo | Out-Null; Move-Item $p $respaldo -Force }
+}
+if (Test-Path $respaldo) { Write-Host "       Version anterior guardada en respaldos\version_anterior_$Fecha" }
+if ((Resolve-Path $nuevo).Path -ne (Join-Path (Resolve-Path $destino).Path 'vur_valorizacion.py')) { Copy-Item $nuevo $actual -Force }
+Write-Host '       vur_valorizacion.py instalado.'
 
 # ---- 5. Librerias ---------------------------------------------------------------
-Paso 5 'Instalando librerias de Python (selenium, pandas, openpyxl)'
-& $py -m pip install --user --upgrade --disable-pip-version-check -q -r (Join-Path $destino 'requirements.txt')
+Paso 5 'Instalando librerias de Python (selenium, pandas, openpyxl, xlrd)'
+& $py -m pip install --user --upgrade --disable-pip-version-check -q @Librerias
 if ($LASTEXITCODE -ne 0) { Falla 'No se pudieron instalar las librerias (revise internet o el proxy de la entidad).' }
 
 # ---- 6. Configuracion y acceso directo --------------------------------------------
@@ -129,21 +153,27 @@ Paso 6 'Configuracion y acceso directo'
 New-Item -ItemType Directory -Force -Path $CfgDir | Out-Null
 @{ carpeta = $destino; instalado = (Get-Date -Format 'yyyy-MM-dd HH:mm'); origen = 'Instalar_VUR.bat' } |
     ConvertTo-Json | Set-Content -Path $Cfg -Encoding UTF8
+& $py $actual --recursos | Out-Null
+$pyw = (& $py -c "import sys, os; print(os.path.join(os.path.dirname(sys.executable), 'pythonw.exe'))").Trim()
+if (-not (Test-Path $pyw)) { $pyw = (& $py -c "import sys; print(sys.executable)").Trim() }
 $escritorio = [Environment]::GetFolderPath('Desktop')
 $atajo = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $escritorio 'Consulta VUR.lnk'))
-$atajo.TargetPath = Join-Path $destino 'Iniciar VUR.bat'
+$atajo.TargetPath = $pyw
+$atajo.Arguments = '"' + $actual + '"'
 $atajo.WorkingDirectory = $destino
-$atajo.IconLocation = Join-Path $destino 'programa\icono_vur.ico'
-$atajo.WindowStyle = 7
+$icono = Join-Path $Usuario 'recursos\icono_vur.ico'
+if (Test-Path $icono) { $atajo.IconLocation = $icono }
 $atajo.Description = 'Consulta de valorizacion en VUR'
 $atajo.Save()
 Write-Host '       Acceso directo "Consulta VUR" creado en el Escritorio.'
 
 # ---- 7. Verificacion ------------------------------------------------------------
 Paso 7 'Verificando el programa (pruebas automaticas)'
-Push-Location (Join-Path $destino 'programa')
-$salida = & $py pruebas_reglas.py 2>&1 | Out-String
-Pop-Location
+# En Windows PowerShell 5.1, leer la salida de error de un programa con 2>&1 se toma como error si
+# ErrorActionPreference es 'Stop'; por eso se relaja solo para este paso.
+$ErrorActionPreference = 'Continue'
+$salida = & $py $actual --probar 2>&1 | Out-String
+$ErrorActionPreference = 'Stop'
 if ($salida -match 'TODAS LAS PRUEBAS PASARON') { Write-Host '       Todas las pruebas pasaron.' }
 else { Aviso 'Algunas pruebas fallaron. Avise al desarrollador antes de usar el programa.'; Write-Host $salida }
 $chrome = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
@@ -154,6 +184,7 @@ Write-Host ''
 Write-Host ' ==========================================================' -ForegroundColor DarkGreen
 Write-Host "   LISTO. Programa instalado en: $destino" -ForegroundColor White
 Write-Host '   Abralo con el acceso directo "Consulta VUR" del Escritorio.' -ForegroundColor White
+Write-Host '   Ya puede borrar el ZIP y la carpeta descargada.' -ForegroundColor White
 Write-Host ' ==========================================================' -ForegroundColor DarkGreen
 $r = Read-Host '   Abrir el programa ahora? (S/N)'
-if ($r -match '^[sS]') { Start-Process -FilePath (Join-Path $destino 'Iniciar VUR.bat') -WorkingDirectory $destino -WindowStyle Minimized }
+if ($r -match '^[sS]') { Start-Process -FilePath $pyw -ArgumentList ('"' + $actual + '"') -WorkingDirectory $destino }
