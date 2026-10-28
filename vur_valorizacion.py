@@ -138,7 +138,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.28-2"
+VERSION_APLICATIVO = "2026.10.28-3"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1178,7 +1178,30 @@ TEXTOS_LARGOS = {"Observaciones", "Cadena_Revisada", "Detalle_Valorizacion", "No
                  "Proyectos_Municipio", "Afectaciones_Valorizacion"}
 
 
-def exportar_excel(registros, ruta):
+def formato_duracion(segundos):
+    """3725 -> '1 h 02 min'; 125 -> '2 min 05 s'; 42 -> '42 s'."""
+    segundos = int(max(segundos, 0))
+    h, resto = divmod(segundos, 3600)
+    m, s_ = divmod(resto, 60)
+    if h:
+        return f"{h} h {m:02d} min"
+    return f"{m} min {s_:02d} s" if m else f"{s_} s"
+
+
+def resumen_tiempo(inicio, hechas, total, fin=None):
+    """Texto del indicador de tiempo: transcurrido, promedio por matrícula y tiempo restante estimado."""
+    ahora = fin or datetime.now()
+    transcurrido = (ahora - inicio).total_seconds()
+    partes = [("Duración " if fin else "Tiempo ") + formato_duracion(transcurrido)]
+    if hechas:
+        promedio = transcurrido / hechas
+        partes.append(f"{promedio:.1f} s por matrícula".replace(".", ","))
+        if not fin and total > hechas:
+            partes.append(f"faltan ~{formato_duracion(promedio * (total - hechas))}")
+    return " · ".join(partes)
+
+
+def exportar_excel(registros, ruta, duracion=""):
     """Escribe el Excel de resultados con encabezado institucional.
 
     Todas las celdas se escriben como texto o número, nunca como fórmula: un
@@ -1239,11 +1262,11 @@ def exportar_excel(registros, ruta):
             celda.font = Font(bold=True, color="A3570A")
         elif celda.value == CONFIABILIDAD_ALTA:
             celda.font = Font(bold=True, color=COLOR["verde"][1:])
-    _hoja_resumen(wb, registros)
+    _hoja_resumen(wb, registros, duracion)
     wb.save(ruta)
 
 
-def _hoja_resumen(wb, registros):
+def _hoja_resumen(wb, registros, duracion=""):
     """Hoja 'Resumen': totales por estado y lista de lo que debe revisar el profesional."""
     from collections import Counter
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -1258,6 +1281,8 @@ def _hoja_resumen(wb, registros):
     ws.append([DEPENDENCIA])
     ws.append(["Generado", f"{datetime.now():%d/%m/%Y %H:%M}"])
     ws.append(["Versión del programa", VERSION_APLICATIVO])
+    if duracion:
+        ws.append(["Tiempo del proceso", duracion])
     ws.append(["Matrículas en el archivo", len(registros)])
     ws.append([])
     ws.append(["Estado", "Cantidad"])
@@ -2138,6 +2163,8 @@ class App:
         self._fuentes()
         self._estilos()
         self.forzar_vur = tk.BooleanVar(value=False)
+        self._inicio_proceso = self._fin_proceso = None   # indicador de tiempo
+        self._hechas = 0
         self._ultima_respuesta = None   # hora de la última respuesta de VUR (para el aviso de inactividad)
         self._forzar = False
         self.n_historico = 0
@@ -2319,8 +2346,16 @@ class App:
         self.n_revisar = 0
         self.lbl_consultas = tk.Label(sup, text="", bg=c["blanco"], fg=c["texto_suave"], font=self.f_pequena)
         self.lbl_consultas.pack(side="right")
-        self.progreso = BarraProgreso(e, c["blanco"])
-        self.progreso.pack(fill="x", pady=(6, 8))
+        fila_barra = tk.Frame(e, bg=c["blanco"])
+        fila_barra.pack(fill="x", pady=(6, 8))
+        self.lbl_tiempo = tk.Label(fila_barra, text="", bg=c["blanco"], fg=c["verde_oscuro"],
+                                   font=self.f_pequena_negrita)
+        self.lbl_tiempo.pack(side="right", padx=(14, 0))
+        Ayuda(self.lbl_tiempo, "Tiempo del proceso: transcurrido, promedio por matrícula y estimación de lo que "
+                               "falta (se ajusta a medida que avanza; las matrículas tomadas del histórico son "
+                               "instantáneas y las que tienen muchas matrices tardan más).", self.f_pequena)
+        self.progreso = BarraProgreso(fila_barra, c["blanco"])
+        self.progreso.pack(side="left", fill="x", expand=True)
         chips = tk.Frame(e, bg=c["blanco"])
         chips.pack(fill="x")
         self.contadores = {}
@@ -2408,11 +2443,19 @@ class App:
                 self._ultima_respuesta = None
             self.semaforo.fijar(estado)
 
+    def _texto_tiempo(self):
+        if not self._inicio_proceso:
+            return ""
+        total = len(self.df) if self.df is not None else 0
+        return resumen_tiempo(self._inicio_proceso, self._hechas, total, self._fin_proceso)
+
     def _vigilar_sesion(self):
         """Cada segundo: actualiza el semáforo (hace cuánto respondió VUR). Cada 15 s, si no hay
         proceso en curso, revisa si el usuario cerró Chrome."""
         self._tics = getattr(self, "_tics", 0) + 1
         try:
+            if self._inicio_proceso and not self._fin_proceso:
+                self.lbl_tiempo.configure(text=self._texto_tiempo())
             ocupado = bool(self.hilo and self.hilo.is_alive())
             if (self._tics % 15 == 0 and not ocupado and self.cliente and self.semaforo.estado != "cerrada"
                     and not self.cliente.vivo()):
@@ -2474,6 +2517,7 @@ class App:
         self._fila_marcada = None
         for chip in self.contadores.values():
             chip.fijar(0)
+        self.lbl_tiempo.configure(text="")
         self.progreso.fijar(0, len(self.df))
         self.lbl_progreso.configure(text=f"0 de {len(self.df)} matrículas")
         self.lbl_consultas.configure(text="")
@@ -2580,6 +2624,7 @@ class App:
                 elif tipo == "progreso":
                     hechas, consultas, reutilizadas, del_historico = dato
                     total = len(self.df) if self.df is not None else 0
+                    self._hechas = hechas
                     self.progreso.fijar(hechas, total)
                     self.lbl_progreso.configure(text=f"{hechas} de {total} matrículas")
                     self.lbl_consultas.configure(
@@ -2599,6 +2644,10 @@ class App:
                     messagebox.showinfo("VUR", dato, parent=self.root)
                 elif tipo == "fin":
                     self._en_ejecucion(False)
+                    if self._inicio_proceso and not self._fin_proceso:
+                        self._fin_proceso = datetime.now()
+                        self.lbl_tiempo.configure(text=self._texto_tiempo())
+                        self._log(f"Tiempo del proceso: {self._texto_tiempo()}")
         except queue.Empty:
             pass
         self.root.after(100, self._procesar_cola)
@@ -2670,6 +2719,7 @@ class App:
         with self.lock:
             self.resultados = []
         self._reiniciar_vista()
+        self._inicio_proceso, self._fin_proceso, self._hechas = datetime.now(), None, 0
         self._en_ejecucion(True)
         self.hilo = threading.Thread(target=self._flujo_consultas, daemon=True)
         self.hilo.start()
@@ -2707,7 +2757,7 @@ class App:
         if not ruta:
             return
         try:
-            exportar_excel(datos, ruta)
+            exportar_excel(datos, ruta, self._texto_tiempo())
             self._log(f"Resultados guardados en {ruta}")
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo guardar (¿está abierto en Excel?):\n{type(e).__name__}: {e}")
@@ -2778,7 +2828,7 @@ class App:
             return
         ruta = self.ruta_excel.with_name(f"{self.ruta_excel.stem}_resultados_parcial.xlsx")
         try:
-            exportar_excel(datos, ruta)
+            exportar_excel(datos, ruta, self._texto_tiempo())
             self.log_hilo(f"Guardado parcial: {ruta.name} ({len(datos)} registros)")
         except Exception as e:
             self.log_hilo(f"No se pudo guardar el parcial (¿está abierto en Excel?): {type(e).__name__}: {e}")
@@ -2834,7 +2884,9 @@ class App:
                 por_revisar = sum(1 for x in self.resultados if x.get("Confiabilidad") == CONFIABILIDAD_REVISAR)
             del_hist = (f"{self.n_historico} matrícula(s) se tomaron del histórico sin consultar VUR "
                         "(columna Fuente).\n\n") if self.n_historico else ""
-            self.cola.put(("info", f"Consultas finalizadas.\n\n{del_hist}{por_revisar} matrícula(s) requieren "
+            duracion = resumen_tiempo(self._inicio_proceso, len(self.df), len(self.df), datetime.now()) \
+                if self._inicio_proceso else ""
+            self.cola.put(("info", f"Consultas finalizadas. {duracion}.\n\n{del_hist}{por_revisar} matrícula(s) requieren "
                                    "revisión del profesional (columna Confiabilidad = REVISAR).\n\n"
                                    "Use 'Guardar Excel' para guardar los resultados."))
         except ProcesoDetenido:
@@ -3636,6 +3688,20 @@ def ejecutar_autopruebas():
             self.assertTrue(any(u.endswith("datosBasicos/tierras/020-4") for u in c.driver.sueltas))
             self.assertEqual(r["estado"], "NO GRAVADA")
             self.assertTrue(any(p.startswith("020-4 ") for p in r["cadena"]))  # se revisó igual, de a una
+
+    class IndicadorTiempo(unittest.TestCase):
+        def test_formatos(self):
+            from datetime import datetime, timedelta
+            self.assertEqual(v.formato_duracion(42), "42 s")
+            self.assertEqual(v.formato_duracion(125), "2 min 05 s")
+            self.assertEqual(v.formato_duracion(3725), "1 h 02 min")
+            inicio = datetime(2026, 10, 28, 10, 0, 0)
+            self.assertTrue(v.resumen_tiempo(inicio, 10, 40).startswith("Tiempo "))
+            fin = inicio + timedelta(seconds=100)
+            self.assertEqual(v.resumen_tiempo(inicio, 10, 10, fin), "Duración 1 min 40 s · 10,0 s por matrícula")
+            en_curso = v.resumen_tiempo(datetime.now() - timedelta(seconds=40), 10, 40)
+            self.assertIn("4,0 s por matrícula", en_curso)
+            self.assertIn("faltan ~2 min 00 s", en_curso)
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
