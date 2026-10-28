@@ -138,7 +138,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.28-1"
+VERSION_APLICATIVO = "2026.10.28-2"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -726,6 +726,10 @@ def revisar_cadena(api, circulo, numero, db_inicial, fecha_limite, log=lambda m:
         if not fecha_limite and not aviso_sin_fecha:
             notas.append("Municipio sin fecha de proyecto: se suben todas las matrices")
             aviso_sin_fecha = True
+        if hasattr(api, "precargar"):  # datos de todas las matrices del folio, varias a la vez
+            cupo = max(MAX_FOLIOS_SEGURIDAD - folios - len(cola), 0)
+            api.precargar([f"datosBasicos/{TIPO_CONSULTA}/{c}-{n}" for c, n in
+                           filter(None, (separar_matricula(m) for m in matrices if m not in vistos))][:cupo])
         for m in matrices:
             if m in vistos:
                 continue
@@ -792,6 +796,28 @@ fetch(url, {credentials: 'include'})
   .catch(e => listo({error: String(e)}));
 """
 
+# Datos básicos de las matrices de un mismo folio: se piden de a CONSULTAS_PARALELAS a la
+# vez (no gasta más cupo: son consultas que igual se harían, una tras otra). Si cualquier
+# respuesta del lote falla, se desactiva para el resto del proceso y se sigue de a una.
+CONSULTAS_PARALELAS = 3
+
+JS_FETCH_VARIOS = r"""
+const urls = arguments[0], limite = arguments[1];
+const listo = arguments[arguments.length - 1];
+const res = new Array(urls.length);
+let siguiente = 0;
+async function trabajador() {
+  while (siguiente < urls.length) {
+    const k = siguiente++;
+    try {
+      const r = await fetch(urls[k], {credentials: 'include'});
+      res[k] = {status: r.status, url: r.url, tipo: r.headers.get('content-type') || '', texto: await r.text()};
+    } catch (e) { res[k] = {error: String(e)}; }
+  }
+}
+Promise.all(Array.from({length: Math.min(limite, urls.length)}, trabajador)).then(() => listo(res));
+"""
+
 
 class VURClient:
     def __init__(self, log, notificar=lambda estado: None):
@@ -802,6 +828,8 @@ class VURClient:
         self.consultas = 0          # peticiones reales a VUR (cuentan para el cupo diario)
         self.consultas_cache = 0    # respuestas reutilizadas sin consultar a VUR
         self._cache = {}
+        self.paralelo = CONSULTAS_PARALELAS
+        self._precargadas = set()   # pedidas en paralelo: no se cuentan como "reutilizadas"
 
     # --- Navegador ---------------------------------------------------------
 
@@ -838,7 +866,9 @@ class VURClient:
         """Al reutilizar la sesión en otro proceso: memoria y contadores desde cero
         (los datos de VUR pueden haber cambiado desde el proceso anterior)."""
         self._cache.clear()
+        self._precargadas.clear()
         self.consultas = self.consultas_cache = 0
+        self.paralelo = CONSULTAS_PARALELAS
 
     def cerrar_navegador(self):
         if self.driver:
@@ -897,7 +927,10 @@ class VURClient:
         para que un fallo temporal de VUR pueda reintentarse.
         """
         if ruta in self._cache:
-            self.consultas_cache += 1
+            if ruta in self._precargadas:
+                self._precargadas.discard(ruta)   # ya se contó como consulta al pedirla en paralelo
+            else:
+                self.consultas_cache += 1
             return self._cache[ruta]
         try:
             datos = self._api_get(ruta)
@@ -916,6 +949,10 @@ class VURClient:
         except JavascriptException as e:
             raise ErrorVUR(f"Error de JavaScript: {mensaje_corto(e)}") from e
         self.consultas += 1
+        return self._interpretar(r)
+
+    def _interpretar(self, r):
+        """Valida una respuesta de fetch() y devuelve los datos (o lanza la excepción que corresponda)."""
         if not r or r.get("error"):
             raise ErrorVUR(f"Fallo de red: {(r or {}).get('error')}")
         destino = (r.get("url") or "").lower()
@@ -931,6 +968,38 @@ class VURClient:
             raise LimiteDiario("VUR: el usuario excedió el número de peticiones por día.")
         self.notificar("activa")
         return datos
+
+    def precargar(self, rutas):
+        """Pide varias rutas a la vez y guarda en memoria las que respondan bien.
+
+        Cualquier problema (red, sesión, respuesta rara) desactiva el modo paralelo para el
+        resto del proceso; las rutas que falten se piden después de a una, como siempre.
+        El cupo diario agotado sí detiene el proceso.
+        """
+        rutas = [r for r in dict.fromkeys(rutas) if r not in self._cache]
+        if self.paralelo <= 1 or len(rutas) < 2:
+            return
+        self._asegurar_origen()
+        try:
+            respuestas = self.driver.execute_async_script(JS_FETCH_VARIOS, [URL_API + r for r in rutas],
+                                                          self.paralelo)
+        except (JavascriptException, TimeoutException) as e:
+            self.paralelo = 1
+            self.log(f"Consultas en paralelo desactivadas ({type(e).__name__}); se sigue de a una.")
+            return
+        for ruta, r in zip(rutas, respuestas or []):
+            self.consultas += 1
+            try:
+                datos = self._interpretar(r)
+            except LimiteDiario:
+                raise
+            except (ErrorVUR, SesionExpirada, ValueError) as e:
+                self.paralelo = 1
+                self.log(f"Consultas en paralelo desactivadas ({type(e).__name__}); se sigue de a una.")
+                continue
+            if datos:
+                self._cache[ruta] = datos
+                self._precargadas.add(ruta)
 
     def datos_basicos(self, circulo, numero):
         return self.api_get(f"datosBasicos/{TIPO_CONSULTA}/{circulo}-{numero}") or None  # {} = no existe
@@ -3519,6 +3588,54 @@ def ejecutar_autopruebas():
             finally:
                 time.sleep = dormir
             self.assertIn("Tampoco tuvo datos en la consulta del 27/10/2026", r["Motivos_Revision"])
+
+    class ConsultasParalelas(unittest.TestCase):
+        """Datos básicos de las matrices de un folio pedidos de a 3, con vuelta a una por una si algo falla."""
+
+        def cliente(self, falla=False):
+            import json as _json
+            datos = {f"datosBasicos/tierras/020-{n}": {"fechaAperturaFolio": "01/01/1970", "matriculasMatriz": []}
+                     for n in range(2, 7)}
+            datos["datosBasicos/tierras/020-1"] = {"fechaAperturaFolio": "01/01/2020",
+                                                   "matriculasMatriz": [f"020-{n}" for n in range(2, 7)]}
+            for n in range(1, 7):
+                datos[f"estadoJuridico/tierras/020-{n}"] = {"textoAnotaciones": [COMPRA]}
+
+            def respuesta(url, en_lote=False):
+                ruta = url.split("consultaIndices/")[1]
+                if falla and en_lote and ruta.endswith("020-4"):  # falla solo dentro del lote
+                    return {"error": "red caída"}
+                return {"status": 200, "url": url, "tipo": "application/json", "texto": _json.dumps(datos.get(ruta, {}))}
+
+            class Navegador:
+                current_url = "https://www.vur.gov.co/portal/pages/vur/inicio.jsf"
+                lotes, sueltas = [], []
+
+                def execute_async_script(self, js, *args):
+                    if js is v.JS_FETCH_VARIOS:
+                        self.lotes.append(len(args[0]))
+                        return [respuesta(u, en_lote=True) for u in args[0]]
+                    self.sueltas.append(args[0])
+                    return respuesta(args[0])
+            c = v.VURClient(lambda m: None)
+            c.driver = Navegador()
+            return c
+
+        def test_lote_y_mismo_resultado(self):
+            c = self.cliente()
+            r = v.revisar_cadena(c, "020", "1", c.datos_basicos("020", "1"), date(1985, 6, 16))
+            self.assertEqual(r["estado"], "NO GRAVADA")
+            self.assertEqual(c.driver.lotes, [5])                   # las 5 matrices en un solo lote
+            self.assertFalse(any("datosBasicos/tierras/020-3" in u for u in c.driver.sueltas))
+            self.assertEqual(c.consultas_cache, 0)                  # no se cuentan como "reutilizadas"
+
+        def test_si_falla_sigue_de_a_una(self):
+            c = self.cliente(falla=True)
+            r = v.revisar_cadena(c, "020", "1", c.datos_basicos("020", "1"), date(1985, 6, 16))
+            self.assertEqual(c.paralelo, 1)
+            self.assertTrue(any(u.endswith("datosBasicos/tierras/020-4") for u in c.driver.sueltas))
+            self.assertEqual(r["estado"], "NO GRAVADA")
+            self.assertTrue(any(p.startswith("020-4 ") for p in r["cadena"]))  # se revisó igual, de a una
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
