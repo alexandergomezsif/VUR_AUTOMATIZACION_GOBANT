@@ -95,6 +95,11 @@ PALABRAS_VALORIZACION = ["VALORIZA", "INVIAS"]
 # anterior a la fecha límite. MAX_FOLIOS_SEGURIDAD solo protege contra un
 # recorrido descontrolado (cada folio son 2 consultas del cupo diario de VUR).
 MAX_FOLIOS_SEGURIDAD = 300
+# Un folio con muchísimas matrices (englobe de un loteo) obligaba a pedir los datos de
+# cada una: el 27/10/2026 la 018-0063397 (folio 018-51493, más de 300 matrices) gastó
+# unas 300 consultas del cupo y 5 minutos para terminar igual en "revisión incompleta".
+# Por encima de este número no se suben una por una y se pide revisión manual.
+MAX_MATRICES_POR_FOLIO = 40
 # Si la revisión no se puede completar (tope de seguridad o una matriz sin
 # respuesta), el estado queda "NO GRAVADA - REVISION INCOMPLETA".
 ESTADO_INCOMPLETO = "NO GRAVADA - REVISION INCOMPLETA"
@@ -133,7 +138,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.27-4"
+VERSION_APLICATIVO = "2026.10.28-1"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -711,6 +716,11 @@ def revisar_cadena(api, circulo, numero, db_inicial, fecha_limite, log=lambda m:
             notas.append(f"{etiqueta}: folio abierto el {apertura:%d/%m/%Y}, en o antes de la fecha límite "
                          f"{fecha_limite:%d/%m/%Y}; no se suben sus matrices")
             continue
+        if len(matrices) > MAX_MATRICES_POR_FOLIO:
+            notas.append(f"{etiqueta}: tiene {len(matrices)} matrículas matriz (englobe); no se revisan una por una "
+                         "para no agotar el cupo diario de VUR: revisión manual")
+            incompleta = True
+            continue
         if not apertura and not aviso_sin_fecha:
             notas.append(f"{etiqueta}: sin fecha de apertura; se revisan sus matrices por precaución")
         if not fecha_limite and not aviso_sin_fecha:
@@ -788,6 +798,7 @@ class VURClient:
         self.log = log
         self.notificar = notificar  # informa el estado de la sesión al semáforo de la ventana
         self.driver = None
+        self.renovada = datetime.now()  # última recarga de la página de inicio (renueva la sesión)
         self.consultas = 0          # peticiones reales a VUR (cuentan para el cupo diario)
         self.consultas_cache = 0    # respuestas reutilizadas sin consultar a VUR
         self._cache = {}
@@ -808,6 +819,20 @@ class VURClient:
         self.driver = webdriver.Chrome(options=opciones)
         self.driver.set_script_timeout(TIMEOUT_API)
         self.notificar("esperando")
+
+    def sesion_vigente(self):
+        """Recarga la página de inicio (renueva la sesión) y revisa que VUR no pida ingresar.
+        No gasta cupo: no consulta ningún servicio."""
+        try:
+            self.abrir_inicio()
+            url = (self.driver.current_url or "").lower()
+        except WebDriverException:
+            return False
+        self.renovada = datetime.now()
+        if "siteminder" in url or "login" in url:
+            self.notificar("vencida")
+            return False
+        return True
 
     def nueva_ejecucion(self):
         """Al reutilizar la sesión en otro proceso: memoria y contadores desde cero
@@ -1960,6 +1985,10 @@ class Ayuda:
 
 # Estado de la sesión -> (color del punto, título, explicación)
 AVISO_INACTIVIDAD_MIN = 10  # VUR cierra la sesión por inactividad; se avisa antes
+# Durante un proceso masivo la página de inicio se recarga cada RENOVAR_SESION_MIN minutos,
+# entre una matrícula y otra, para renovar la sesión (no gasta cupo). Solo mientras el
+# funcionario tiene un proceso en curso; con el programa quieto no se renueva nada.
+RENOVAR_SESION_MIN = 8
 ESTADOS_SESION = {
     "cerrada": ("#9AA8A1", "Sin sesión", "Chrome está cerrado. Se abrirá al iniciar consultas."),
     "esperando": ("#E0A100", "Esperando ingreso", "Inicie sesión y resuelva el captcha en Chrome."),
@@ -1990,11 +2019,12 @@ class Semaforo(tk.Frame):
 
     def fijar(self, estado, detalle=None):
         color, titulo, explicacion = ESTADOS_SESION[estado]
-        img = imagen_cache(self, ("semaforo", color, self._fondo), lambda: pintar_en(
-            lienzo(20, 20, self._fondo), 2, 2, 16, 16, 8, mezclar(color, "#FFFFFF", 0.25), color,
-            sombra=(0.18, 0.5, 2.0), brillo=0.35))
-        self._punto.itemconfigure(self._img, image=img)
-        self.estado = estado
+        if estado != self.estado:
+            img = imagen_cache(self, ("semaforo", color, self._fondo), lambda: pintar_en(
+                lienzo(20, 20, self._fondo), 2, 2, 16, 16, 8, mezclar(color, "#FFFFFF", 0.25), color,
+                sombra=(0.18, 0.5, 2.0), brillo=0.35))
+            self._punto.itemconfigure(self._img, image=img)
+            self.estado = estado
         self._titulo.configure(text=f"VUR · {titulo}")
         self._detalle.configure(text=detalle or explicacion)
 
@@ -2059,7 +2089,7 @@ class App:
             self._log(f"Histórico no disponible: {type(e).__name__}: {e}")
         self.root.protocol("WM_DELETE_WINDOW", self._al_cerrar)
         self.root.after(100, self._procesar_cola)
-        self.root.after(15000, self._vigilar_sesion)
+        self.root.after(1000, self._vigilar_sesion)
 
     # --- Apariencia ------------------------------------------------------------
 
@@ -2310,18 +2340,26 @@ class App:
             self.semaforo.fijar(estado)
 
     def _vigilar_sesion(self):
-        """Cada 15 s: avisa la inactividad y detecta si el usuario cerró Chrome (solo sin proceso en curso)."""
+        """Cada segundo: actualiza el semáforo (hace cuánto respondió VUR). Cada 15 s, si no hay
+        proceso en curso, revisa si el usuario cerró Chrome."""
+        self._tics = getattr(self, "_tics", 0) + 1
         try:
             ocupado = bool(self.hilo and self.hilo.is_alive())
-            if not ocupado and self.cliente and self.semaforo.estado != "cerrada" and not self.cliente.vivo():
+            if (self._tics % 15 == 0 and not ocupado and self.cliente and self.semaforo.estado != "cerrada"
+                    and not self.cliente.vivo()):
                 self.cliente.driver = None
                 self._estado_sesion("cerrada")
             elif self.semaforo.estado in ("activa", "inactiva") and self._ultima_respuesta:
-                minutos = int((datetime.now() - self._ultima_respuesta).total_seconds() // 60)
-                if minutos >= AVISO_INACTIVIDAD_MIN:
-                    self.semaforo.fijar("inactiva", f"Sin actividad hace {minutos} min: puede pedir ingresar de nuevo")
+                segundos = int((datetime.now() - self._ultima_respuesta).total_seconds())
+                consultas = self.cliente.consultas if self.cliente else 0
+                if segundos >= AVISO_INACTIVIDAD_MIN * 60:
+                    self.semaforo.fijar("inactiva", f"Sin actividad hace {segundos // 60} min: puede pedir "
+                                                    "ingresar de nuevo")
+                else:
+                    hace = f"{segundos} s" if segundos < 60 else f"{segundos // 60} min {segundos % 60:02d} s"
+                    self.semaforo.fijar("activa", f"Respondió hace {hace} · {consultas} consultas en este proceso")
         finally:
-            self.root.after(15000, self._vigilar_sesion)
+            self.root.after(1000, self._vigilar_sesion)
 
     def _obtener_cliente(self):
         """Reutiliza el Chrome abierto (y su sesión) o prepara uno nuevo."""
@@ -2679,7 +2717,13 @@ class App:
     def _flujo_consultas(self):
         cliente, sesion_vur = self._obtener_cliente()
         if sesion_vur:
-            self.log_hilo("Se reutiliza la sesión de VUR abierta en Chrome.")
+            # Antes de un proceso largo se confirma que la sesión sigue viva, para no descubrirlo a mitad.
+            if cliente.sesion_vigente():
+                self.log_hilo("Se reutiliza la sesión de VUR abierta en Chrome (verificada).")
+                cliente.notificar("activa")
+            else:
+                self.log_hilo("La sesión de VUR abierta ya no está activa: hay que ingresar de nuevo.")
+                sesion_vur = False
         self.n_historico = 0
         try:
             self.historico.cargar()  # puede haber consultas nuevas de otra ventana o funcionario
@@ -2699,6 +2743,11 @@ class App:
                             self.log_hilo("Proceso cancelado por el usuario.")
                             return
                         sesion_vur = True
+                        cliente.renovada = datetime.now()
+                    elif (datetime.now() - cliente.renovada).total_seconds() >= RENOVAR_SESION_MIN * 60:
+                        self.log_hilo("Renovación preventiva de la sesión de VUR (recarga de la página de inicio).")
+                        if not cliente.sesion_vigente() and not self._iniciar_sesion(cliente):
+                            raise ProcesoDetenido()
                     resultado = self._consultar_y_registrar(cliente, fila)
                 else:
                     self.n_historico += 1
@@ -2751,11 +2800,24 @@ class App:
         self.log_hilo(f"{fila['Matricula_Limpia']}: tomada del histórico ({explicacion}) -> {registro['Estado']}")
         return registro
 
-    def _consultar_y_registrar(self, cliente, fila):
-        """Consulta VUR, compara con la consulta anterior (si la hay) y guarda en el histórico."""
+    def _consultar_y_registrar(self, cliente, fila, anterior=None):
+        """Consulta VUR, compara con la consulta anterior (si la hay) y guarda en el histórico.
+
+        anterior: resultado de la primera pasada, cuando esta es la segunda pasada.
+        """
         nuevo = self._procesar_matricula(cliente, fila)
         nuevo.update(Fuente="VUR", Funcionario=self.usuario, Equipo=self.equipo)
+        if anterior is not None:
+            nuevo["Segunda_Pasada"] = (f"Consultada de nuevo: se confirmó {nuevo['Estado']}"
+                                       if nuevo["Estado"] == anterior["Estado"] else
+                                       f"Consultada de nuevo: cambió de {anterior['Estado']} a {nuevo['Estado']}")
         previo = self._previo.get(nuevo["Matricula_Limpia"])
+        if previo and previo.get("Estado") == "SIN DATOS EN VUR" and nuevo.get("Estado") == "SIN DATOS EN VUR":
+            fecha = _fecha_registro(previo)
+            nuevo["Motivos_Revision"] = "; ".join(x for x in (
+                nuevo.get("Motivos_Revision"), "Tampoco tuvo datos en la consulta del "
+                f"{fecha:%d/%m/%Y}" if fecha else "Tampoco tuvo datos en la consulta anterior") if x) + \
+                ": probablemente el número no existe en VUR; verifique la matrícula"
         if previo and previo.get("Estado") in ESTADOS_VALIDOS and nuevo.get("Estado") in ESTADOS_VALIDOS \
                 and previo["Estado"] != nuevo["Estado"]:
             fecha = _fecha_registro(previo)
@@ -2794,11 +2856,7 @@ class App:
             with self.lock:
                 anterior = dict(self.resultados[i])
             self.cola.put(("estado", f"Segunda pasada: {n} de {len(pendientes)}"))
-            nuevo = self._consultar_y_registrar(cliente, self.df.iloc[i])
-            if nuevo["Estado"] == anterior["Estado"]:
-                nuevo["Segunda_Pasada"] = f"Consultada de nuevo: se confirmó {nuevo['Estado']}"
-            else:
-                nuevo["Segunda_Pasada"] = f"Consultada de nuevo: cambió de {anterior['Estado']} a {nuevo['Estado']}"
+            nuevo = self._consultar_y_registrar(cliente, self.df.iloc[i], anterior)
             self.log_hilo(f"{nuevo['Matricula_Limpia']}: {nuevo['Segunda_Pasada']}")
             with self.lock:
                 self.resultados[i] = nuevo
@@ -3426,6 +3484,41 @@ def ejecutar_autopruebas():
                 self.assertTrue(any(dim.hidden and dim.min <= openpyxl.utils.column_index_from_string(oculta) <= dim.max
                                     for dim in ws.column_dimensions.values()))
                 wb.close()
+
+    class Auditoria281026(unittest.TestCase):
+        """Hallazgos de la auditoría del 28/10/2026 con los registros reales del histórico."""
+
+        def test_englobe_no_gasta_cupo(self):
+            matrices = [f"018-{n}" for n in range(1000, 1000 + v.MAX_MATRICES_POR_FOLIO + 5)]
+            db = {"018-1": {"fechaAperturaFolio": "16/07/1993", "matriculasMatriz": ["018-2"]},
+                  "018-2": {"fechaAperturaFolio": "24/12/1990", "matriculasMatriz": matrices}}
+            api = API(db, {})
+            llamadas = []
+            original = api.datos_basicos
+            api.datos_basicos = lambda c, n: llamadas.append(n) or original(c, n)
+            r = v.revisar_cadena(api, "018", "1", db["018-1"], date(1989, 6, 6))
+            self.assertEqual(r["estado"], v.ESTADO_INCOMPLETO)
+            self.assertLessEqual(len(llamadas), 2)          # antes: una consulta por cada matriz
+            self.assertTrue(any("englobe" in n for n in r["notas"]))
+
+        def test_sin_datos_repetido_se_explica(self):
+            import queue
+            import tempfile
+            import threading
+            app = v.App.__new__(v.App)
+            app.cola, app.lock, app.detener = queue.Queue(), threading.Lock(), threading.Event()
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            app.historico, app.usuario, app.equipo = v.Historico(tmp.name), "prueba", "PC"
+            app._previo = {"017-0930102": {"Estado": "SIN DATOS EN VUR", "Fecha_Consulta": "2026-10-27 15:09:25"}}
+            import time
+            dormir, time.sleep = time.sleep, lambda s: None
+            try:
+                r = app._consultar_y_registrar(API({}, {}), {"Matricula_Original": "MI 017-0930102",
+                                                             "Matricula_Limpia": "017-0930102"})
+            finally:
+                time.sleep = dormir
+            self.assertIn("Tampoco tuvo datos en la consulta del 27/10/2026", r["Motivos_Revision"])
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
