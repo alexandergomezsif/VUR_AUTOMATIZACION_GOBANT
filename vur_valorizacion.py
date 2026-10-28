@@ -103,6 +103,11 @@ MAX_MATRICES_POR_FOLIO = 40
 # Si la revisión no se puede completar (tope de seguridad o una matriz sin
 # respuesta), el estado queda "NO GRAVADA - REVISION INCOMPLETA".
 ESTADO_INCOMPLETO = "NO GRAVADA - REVISION INCOMPLETA"
+# Si el folio de la matrícula consultada no está ACTIVO en VUR (p. ej. CERRADO), no se
+# genera paz y salvo: no se consulta el estado jurídico ni las matrices (ahorra tiempo y
+# cupo). Solo aplica a la matrícula consultada: las matrices suelen estar cerradas porque
+# de ellas nacieron otros folios, y esas sí se revisan.
+ESTADO_FOLIO_NO_ACTIVO = "FOLIO NO ACTIVO"
 # Fecha límite del municipio: la más antigua de sus proyectos, tomando para cada
 # proyecto la Fecha de Inicio (hoja Vencimiento) o, si no la tiene, la fecha de
 # la resolución (hoja Proyectos Valorización) o el 1 de enero de su año.
@@ -138,7 +143,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.28-3"
+VERSION_APLICATIVO = "2026.10.28-4"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1148,6 +1153,7 @@ ESTILO_ESTADO = {
     ESTADO_INCOMPLETO: ("Incompletas", COLOR["morado"], "#EFE4F2"),
     "SIN DATOS EN VUR": ("Sin datos", COLOR["texto_suave"], "#ECEFED"),
     "ERROR": ("Error", COLOR["rojo"], "#F8E1DF"),
+    ESTADO_FOLIO_NO_ACTIVO: ("No activos", "#4A5651", "#E4E8E6"),
 }
 
 
@@ -1158,6 +1164,7 @@ CONCLUSIONES = {
     ESTADO_INCOMPLETO: "NO SE HALLÓ VALORIZACIÓN, PERO LA REVISIÓN DE MATRICES QUEDÓ INCOMPLETA",
     "SIN DATOS EN VUR": "NO SE PUDO CONSULTAR (VUR SIN DATOS)",
     "ERROR": "NO SE PUDO CONSULTAR (ERROR)",
+    ESTADO_FOLIO_NO_ACTIVO: "FOLIO NO ACTIVO: NO SE GENERA PAZ Y SALVO",
 }
 
 
@@ -1456,7 +1463,7 @@ def comparar_resultados(ruta_antes, ruta_ahora, ruta_salida):
 #        filtrar. Se regenera al terminar cada proceso; no se edita a mano.
 
 VIGENCIA_HISTORICO_DIAS = 30   # un resultado más antiguo se vuelve a consultar en VUR
-ESTADOS_REUTILIZABLES = {"NO GRAVADA", "GRAVADA", "GRAVAMEN CANCELADO"}
+ESTADOS_REUTILIZABLES = {"NO GRAVADA", "GRAVADA", "GRAVAMEN CANCELADO", ESTADO_FOLIO_NO_ACTIVO}
 ESTADOS_VALIDOS = ESTADOS_REUTILIZABLES | {ESTADO_INCOMPLETO}
 
 
@@ -1984,13 +1991,13 @@ class Chip(tk.Canvas):
         from tkinter import font as tkfont
         self._fn = tkfont.Font(root=padre, font=fuente_num)
         f = tkfont.Font(root=padre, font=fuente)
-        self._ancho = 12 + self._fn.measure("0000") + 6 + f.measure(titulo) + 12
+        self._ancho = 9 + self._fn.measure("0000") + 5 + f.measure(titulo) + 10
         super().__init__(padre, width=self._ancho, height=self.ALTO, bg=fondo, highlightthickness=0, bd=0)
         img = imagen_cache(self, ("chip", self._ancho, fondo_chip, fondo), lambda: pintar_en(
             lienzo(self._ancho, self.ALTO, fondo), 0, 0, self._ancho, self.ALTO, self.ALTO / 2,
             fondo_chip, borde=mezclar(fondo_chip, color, 0.16)))
         self.create_image(0, 0, image=img, anchor="nw")
-        self._num = self.create_text(12, self.ALTO / 2, text="0", anchor="w", font=self._fn, fill=color)
+        self._num = self.create_text(9, self.ALTO / 2, text="0", anchor="w", font=self._fn, fill=color)
         self._tit = self.create_text(0, self.ALTO / 2, text=titulo, anchor="w", font=f, fill=color)
         self.valor = 0
         self.fijar(0)
@@ -1998,7 +2005,7 @@ class Chip(tk.Canvas):
     def fijar(self, n):
         self.valor = n
         self.itemconfigure(self._num, text=str(n))
-        self.coords(self._tit, 12 + self._fn.measure(str(n)) + 6, self.ALTO / 2)
+        self.coords(self._tit, 9 + self._fn.measure(str(n)) + 5, self.ALTO / 2)
 
 
 class BarraProgreso(tk.Canvas):
@@ -2361,7 +2368,7 @@ class App:
         self.contadores = {}
         for estado_reg, (titulo, color, fondo) in ESTILO_ESTADO.items():
             chip = Chip(chips, titulo, color, fondo, c["blanco"], self.f_pequena, self.f_numero)
-            chip.pack(side="left", padx=(0, 8))
+            chip.pack(side="left", padx=(0, 6))
             self.contadores[estado_reg] = chip
         self.chk_forzar = ttk.Checkbutton(chips, text="Forzar consulta en VUR", variable=self.forzar_vur,
                                           style="Opcion.TCheckbutton", takefocus=1)
@@ -3058,6 +3065,19 @@ class App:
             Fecha_Limite_Revision=f"{limite:%d/%m/%Y}" if limite else "",
         )
 
+        estado_folio = normalizar(campos.get("Estado_Folio"))
+        if estado_folio and estado_folio != "ACTIVO":  # vacío = VUR no lo informa: se consulta por precaución
+            registro.update(
+                Clasificacion_Municipio=etiqueta or "SIN CLASIFICAR",
+                Estado=ESTADO_FOLIO_NO_ACTIVO,
+                Confiabilidad=CONFIABILIDAD_ALTA,
+                Notas_Proceso="; ".join(notas + [f"Folio en estado {campos.get('Estado_Folio')} según VUR: no se "
+                                                 "genera paz y salvo; no se consultó el estado jurídico ni las "
+                                                 "matrices"]),
+            )
+            self.log_hilo(f"{circulo}-{numero}: folio {campos.get('Estado_Folio')} -> no se consulta valorización")
+            return dict(registro)
+
         if estado_mpio in ESTADOS_SIN_CONSULTA:
             registro.update(
                 Clasificacion_Municipio=etiqueta,
@@ -3702,6 +3722,30 @@ def ejecutar_autopruebas():
             en_curso = v.resumen_tiempo(datetime.now() - timedelta(seconds=40), 10, 40)
             self.assertIn("4,0 s por matrícula", en_curso)
             self.assertIn("faltan ~2 min 00 s", en_curso)
+
+    class FolioNoActivo(unittest.TestCase):
+        """Pedido del 28/10/2026: si el folio no está activo no se genera paz y salvo."""
+
+        def test_cerrado_no_consulta_estado_juridico(self):
+            db = dict(db_basico("BELLO"), estadoFolio="CERRADO")
+            r = consultar({"008-1": db}, {"008-1": {"textoAnotaciones": [COMPRA, VAL_430]}}, "008", "1")
+            self.assertEqual((r["Estado"], r["Confiabilidad"]), (v.ESTADO_FOLIO_NO_ACTIVO, "ALTA"))
+            self.assertEqual(r["Cadena_Revisada"], "")             # no se revisó nada más
+            self.assertIn("NO SE GENERA PAZ Y SALVO", v.conclusion(r))
+
+        def test_activo_o_sin_dato_si_se_consulta(self):
+            for estado in ("ACTIVO", ""):
+                db = dict(db_basico("BELLO"), estadoFolio=estado)
+                r = consultar({"008-1": db}, {"008-1": {"textoAnotaciones": [COMPRA, VAL_430]}}, "008", "1")
+                self.assertEqual(r["Estado"], "GRAVADA")
+
+        def test_matriz_cerrada_si_se_revisa(self):
+            hijo = db_basico("BELLO", "19/12/2024", ["008-2"])
+            madre = dict(db_basico("BELLO", "01/01/1990"), estadoFolio="CERRADO")
+            r = consultar({"008-1": hijo, "008-2": madre},
+                          {"008-1": {"textoAnotaciones": []}, "008-2": {"textoAnotaciones": [COMPRA, VAL_430]}},
+                          "008", "1")
+            self.assertEqual((r["Estado"], r["Matricula_Con_Anotacion"]), ("GRAVADA", "008-2"))
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
