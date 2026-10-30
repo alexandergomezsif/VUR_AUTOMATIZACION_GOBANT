@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-5"
+VERSION_APLICATIVO = "2026.10.30-6"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -998,8 +998,17 @@ def validar_programa(ruta, probar=True):
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"no se pudieron ejecutar las pruebas ({type(e).__name__})"
-    if "TODAS LAS PRUEBAS PASARON" not in (r.stdout or "") + (r.stderr or ""):
-        return False, "la versión nueva no pasó las pruebas automáticas en este equipo"
+    salida = (r.stdout or "") + (r.stderr or "")
+    try:  # para soporte: qué prueba falló
+        CARPETA_USUARIO.mkdir(parents=True, exist_ok=True)
+        (CARPETA_USUARIO / "pruebas_actualizacion.log").write_text(salida, encoding="utf-8")
+    except OSError:
+        pass
+    if "TODAS LAS PRUEBAS PASARON" not in salida:
+        fallas = [l.split(" ... ")[0] for l in salida.splitlines() if l.endswith(("... FAIL", "... ERROR"))]
+        return False, ("la versión nueva no pasó las pruebas automáticas en este equipo"
+                       + (f" ({'; '.join(fallas[:3])})" if fallas else "")
+                       + f". Detalle en {CARPETA_USUARIO / 'pruebas_actualizacion.log'}")
     return True, "pasó las pruebas automáticas"
 
 
@@ -4264,7 +4273,10 @@ def ejecutar_autopruebas():
                 (Path(d) / "lockfile").write_text("x")
                 self.assertFalse(v.perfil_en_uso(d))          # resto de un Chrome cerrado: se borra
                 self.assertFalse((Path(d) / "lockfile").exists())
-                (Path(d) / "SingletonLock").symlink_to("PC-123")
+                try:
+                    (Path(d) / "SingletonLock").symlink_to("PC-123")
+                except OSError:
+                    return  # Windows sin permiso para crear enlaces: esa parte solo aplica a Linux/macOS
                 self.assertTrue(v.perfil_en_uso(d))           # Chrome abierto (Linux)
 
     casos = [c for c in list(locals().values())
