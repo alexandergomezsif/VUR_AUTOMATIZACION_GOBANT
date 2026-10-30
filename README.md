@@ -41,6 +41,22 @@ Antes de consultar VUR, el programa revisa el **histórico**. Si una matrícula 
 de 30 días con confiabilidad ALTA, toma ese resultado (columna *Fuente* = Histórico) y no gasta
 cupo de VUR. Para consultarla de nuevo, marque **«Forzar consulta en VUR»**.
 
+### VUR en una pestaña de su Chrome (conector)
+
+Sin el conector, el programa abre VUR en una ventana de Chrome aparte. Con el conector, VUR trabaja en
+una pestaña de la ventana de Chrome que usted ya tiene abierta. Se instala una sola vez:
+
+1. En el programa: **Ayuda → Instalar conector de Chrome**. Se abre `chrome://extensions` y la carpeta del conector.
+2. Active **Modo de desarrollador** (arriba a la derecha).
+3. Pulse **Cargar extensión sin empaquetar** y elija la carpeta
+   `%LOCALAPPDATA%\VUR_Valorizacion\conector_chrome`.
+4. Abra VUR en una pestaña e inicie sesión. El programa lo detecta solo («Acerca de» muestra el estado).
+
+El conector solo trabaja en páginas de `vur.gov.co` y solo habla con el propio equipo (`127.0.0.1`).
+No ejecuta código que le envíen: solo consulta direcciones de VUR y recarga la página de inicio.
+Si una actualización trae conector nuevo, el programa avisa: pulse el botón de recargar de
+«Conector VUR» en `chrome://extensions`.
+
 ## Carpetas en el equipo
 
 | Carpeta | Contenido |

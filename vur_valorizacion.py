@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-6"
+VERSION_APLICATIVO = "2026.10.30-7"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1038,6 +1038,284 @@ def instalar_actualizacion(log=lambda m: None):
     return True, f"instalada; la versión anterior quedó en respaldos\\vur_valorizacion_{VERSION_APLICATIVO}.py"
 
 
+# ---------------------------------------------------------------------------
+# Conector VUR: extensión para trabajar en una PESTAÑA del Chrome normal del usuario
+# ---------------------------------------------------------------------------
+# Chrome (desde la versión 136) no permite que un programa controle el perfil normal del
+# usuario. Por eso, en lugar de controlar Chrome, el usuario instala una extensión propia
+# (Ayuda > Instalar conector de Chrome). La extensión vive en las pestañas de VUR: desde
+# ahí hace las mismas consultas que antes hacía Selenium, con la sesión que el usuario
+# inició, y se las pasa a este programa por una conexión que solo existe dentro del
+# equipo (127.0.0.1). La extensión no ejecuta código que le mande el programa: solo sabe
+# hacer tres cosas (consultar una dirección de VUR, informar en qué página está y abrir
+# la página de inicio). El programa solo acepta mensajes de esa extensión.
+
+PUERTO_CONECTOR = 47321
+VERSION_CONECTOR = "1.0.0"
+ID_CONECTOR = "ibjeklednnnddapcoiinbpeihhoabbpe"   # fijo, derivado de la clave pública del manifiesto
+CARPETA_CONECTOR = CARPETA_USUARIO / "conector_chrome"
+LATIDO_CONECTOR_S = 45   # si la pestaña de VUR no se reporta en este tiempo, se da por cerrada
+
+EXTENSION_CHROME = {
+    "manifest.json": """{
+  "manifest_version": 3,
+  "name": "Conector VUR - Gobernación de Antioquia",
+  "version": "VERSION_CONECTOR",
+  "description": "Conecta las pestañas de VUR con el programa de consulta de valorización (Secretaría de Infraestructura). Solo se comunica con el propio equipo (127.0.0.1).",
+  "key": "CLAVE_MANIFIESTO",
+  "icons": {"128": "icono128.png"},
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["https://www.vur.gov.co/*", "https://vur.gov.co/*"],
+                       "js": ["content.js"], "run_at": "document_idle"}],
+  "host_permissions": ["http://127.0.0.1:PUERTO_CONECTOR/*"]
+}
+""",
+    "background.js": """// Puente entre la pestaña de VUR (content.js) y el programa local (127.0.0.1).
+const PROGRAMA = "http://127.0.0.1:PUERTO_CONECTOR";
+chrome.runtime.onMessage.addListener((mensaje, _remitente, responder) => {
+  const ruta = mensaje.tipo === "resultado" ? "/resultado" : "/sondeo";
+  fetch(PROGRAMA + ruta, {method: "POST", headers: {"Content-Type": "application/json"},
+                          body: JSON.stringify(mensaje)})
+    .then(r => r.status === 200 ? r.json() : {})
+    .then(responder)
+    .catch(() => responder({error: "programa_cerrado"}));
+  return true;  // la respuesta llega después (consulta en espera)
+});
+""",
+    "content.js": """// Corre dentro de cada pestaña de VUR. Pide trabajo al programa y lo hace con la sesión
+// de esta pestaña. Solo sabe: consultar direcciones de VUR y abrir otra página de VUR.
+(async function () {
+  const version = chrome.runtime.getManifest().version;
+  const esperar = ms => new Promise(r => setTimeout(r, ms));
+  const enviar = m => chrome.runtime.sendMessage(m).catch(e => ({error: String(e)}));
+  const esDeVur = u => { try { return new URL(u).hostname.endsWith("vur.gov.co"); } catch (e) { return false; } };
+  async function consultar(urls, limite) {
+    const res = new Array(urls.length);
+    let siguiente = 0;
+    async function trabajador() {
+      while (siguiente < urls.length) {
+        const k = siguiente++;
+        if (!esDeVur(urls[k])) { res[k] = {error: "dirección no permitida"}; continue; }
+        try {
+          const r = await fetch(urls[k], {credentials: "include"});
+          res[k] = {status: r.status, url: r.url, tipo: r.headers.get("content-type") || "", texto: await r.text()};
+        } catch (e) { res[k] = {error: String(e)}; }
+      }
+    }
+    await Promise.all(Array.from({length: Math.max(1, Math.min(limite || 1, urls.length))}, trabajador));
+    return res;
+  }
+  while (true) {
+    const r = await enviar({tipo: "sondeo", url: location.href, version});
+    if (!r || r.error) { await esperar(4000); continue; }   // programa cerrado: se reintenta
+    const t = r.trabajo;
+    if (!t) continue;
+    if (t.tipo === "navegar" && esDeVur(t.url)) {
+      await enviar({tipo: "resultado", id: t.id, datos: "ok"});
+      location.href = t.url;   // la página nueva vuelve a cargar este script
+      return;
+    }
+    if (t.tipo === "consultar") {
+      await enviar({tipo: "resultado", id: t.id, datos: await consultar(t.urls, t.limite)});
+    }
+  }
+})();
+""",
+}
+# Clave pública del manifiesto: fija el identificador de la extensión (ID_CONECTOR).
+CLAVE_MANIFIESTO = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyR7E69rmGiqUbbnYSlfRyBjSKdtwyGSI0TIjAgZqwdoWD7Rqt04s512UIYVBJ1DZUbUFqQvXgm+rWCKtKAN0f11VHskWOJL1tzmAEiAPij1lJdxSZp8lZ5RPwQONAXrOgYtuZttMtgtled29vMun+Z9W/+d2q/rUDTFuOYUNIQInmtFpC0HZMCR8hl22gwp7upPDdl+NEBhatyB9JNQc8SZjq7rLIAbBWppJoCeYj5Pz4xAqtpmROmOl4T1WOg3n2aIhIJHPGSOkk31NYh/L3RSNPFXudHAH5TmED75PRrTrx0WwU4DxSuBi1G/K8w5vmF8jU8b9ATMgcJv634SyTwIDAQAB"
+EXTENSION_CHROME = {nombre: texto.replace("VERSION_CONECTOR", VERSION_CONECTOR)
+                    .replace("PUERTO_CONECTOR", str(PUERTO_CONECTOR)).replace("CLAVE_MANIFIESTO", CLAVE_MANIFIESTO)
+                    for nombre, texto in EXTENSION_CHROME.items()}
+
+
+def preparar_conector():
+    """Escribe la extensión en CARPETA_CONECTOR (para 'Cargar descomprimida' en Chrome)."""
+    import base64
+    CARPETA_CONECTOR.mkdir(parents=True, exist_ok=True)
+    for nombre, texto in EXTENSION_CHROME.items():
+        (CARPETA_CONECTOR / nombre).write_text(texto, encoding="utf-8")
+    (CARPETA_CONECTOR / "icono128.png").write_bytes(
+        base64.b64decode("".join(RECURSOS["conector_icono128.png"].split())))
+    return CARPETA_CONECTOR
+
+
+class _NoHace:
+    """Partes de Selenium que en el conector no hacen nada (no hay marcos ni alertas que manejar)."""
+
+    @property
+    def alert(self):
+        raise NoAlertPresentException()
+
+    def default_content(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class ConectorChrome:
+    """Puente con la extensión. Se comporta como el "driver" de Selenium que usa VURClient
+    (execute_async_script, current_url, get, window_handles), así el resto no cambia."""
+
+    def __init__(self, puerto=PUERTO_CONECTOR, origen=f"chrome-extension://{ID_CONECTOR}"):
+        self.puerto, self.origen = puerto, origen
+        self._trabajos = queue.Queue()
+        self._resultados = {}
+        self._lock = threading.Lock()
+        self._siguiente = 0
+        self.ultimo_latido = None
+        self.url_actual = ""
+        self.version_extension = ""
+        self.timeout = TIMEOUT_API
+        self.switch_to = self.service = _NoHace()
+        self._servidor = None
+
+    # --- servidor local ---
+    def iniciar(self):
+        """Abre el puerto local. Devuelve False si otro programa ya lo usa."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        puente = self
+
+        class Manejador(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                if self.headers.get("Origin") != puente.origen:   # solo la extensión del aplicativo
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                try:
+                    largo = int(self.headers.get("Content-Length") or 0)
+                    mensaje = json.loads(self.rfile.read(largo) or b"{}")
+                except (ValueError, OSError):
+                    mensaje = {}
+                respuesta = puente._atender(self.path, mensaje)
+                cuerpo = json.dumps(respuesta).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(cuerpo)))
+                self.end_headers()
+                self.wfile.write(cuerpo)
+
+        try:
+            self._servidor = ThreadingHTTPServer(("127.0.0.1", self.puerto), Manejador)
+        except OSError:
+            return False
+        self._servidor.daemon_threads = True
+        threading.Thread(target=self._servidor.serve_forever, daemon=True).start()
+        return True
+
+    def detener(self):
+        if self._servidor:
+            self._servidor.shutdown()
+            self._servidor.server_close()
+            self._servidor = None
+
+    def _atender(self, ruta, mensaje):
+        import time
+        if ruta == "/sondeo":
+            self.ultimo_latido = time.time()
+            self.url_actual = str(mensaje.get("url") or "")
+            self.version_extension = str(mensaje.get("version") or "")
+            try:
+                return {"trabajo": self._trabajos.get(timeout=20)}   # espera larga: respuesta inmediata
+            except queue.Empty:
+                return {}
+        if ruta == "/resultado":
+            with self._lock:
+                espera = self._resultados.get(mensaje.get("id"))
+            if espera:
+                espera["datos"] = mensaje.get("datos")
+                espera["listo"].set()
+            return {}
+        return {}
+
+    def conectado(self):
+        import time
+        return bool(self.ultimo_latido) and time.time() - self.ultimo_latido < LATIDO_CONECTOR_S
+
+    def _encargar(self, trabajo, timeout=None):
+        with self._lock:
+            self._siguiente += 1
+            trabajo["id"] = self._siguiente
+            espera = self._resultados[trabajo["id"]] = {"listo": threading.Event(), "datos": None}
+        self._trabajos.put(trabajo)
+        try:
+            if not espera["listo"].wait(timeout or self.timeout):
+                raise TimeoutException("La pestaña de VUR no respondió a tiempo (¿se cerró?).")
+            return espera["datos"]
+        finally:
+            with self._lock:
+                self._resultados.pop(trabajo["id"], None)
+
+    # --- lo que usa VURClient (mismo nombre que en Selenium) ---
+    @property
+    def window_handles(self):
+        if not self.conectado():
+            raise WebDriverException("No hay una pestaña de VUR abierta con el conector.")
+        return ["vur"]
+
+    @property
+    def current_url(self):
+        return self.url_actual if self.conectado() else ""
+
+    def set_script_timeout(self, segundos):
+        self.timeout = segundos
+
+    def execute_async_script(self, js, *args):
+        if js is JS_FETCH:
+            return (self._encargar({"tipo": "consultar", "urls": [args[0]], "limite": 1}) or [None])[0]
+        if js is JS_FETCH_VARIOS:
+            return self._encargar({"tipo": "consultar", "urls": list(args[0]), "limite": int(args[1])})
+        raise JavascriptException("El conector solo hace consultas a VUR.")
+
+    def get(self, url):
+        import time
+        if not self.conectado():
+            abrir_en_chrome_del_usuario(url)
+        else:
+            self._encargar({"tipo": "navegar", "url": url}, timeout=30)
+        limite = time.time() + 60
+        antes = self.ultimo_latido
+        while time.time() < limite:   # espera a que la página nueva se reporte
+            if self.conectado() and self.ultimo_latido != antes:
+                return
+            time.sleep(0.25)
+
+    def quit(self):
+        pass
+
+
+def abrir_en_chrome_del_usuario(url):
+    """Abre la dirección en una pestaña nueva del Chrome que el usuario ya tiene abierto."""
+    import subprocess
+    import webbrowser
+    exe = ruta_chrome()
+    if exe:
+        subprocess.Popen([exe, url])   # con Chrome abierto, abre una pestaña en la ventana activa
+    else:
+        webbrowser.open(url)
+
+
+def conector_conocido():
+    """True si la extensión ya se reportó alguna vez en este usuario (entonces se usa por defecto)."""
+    return (CARPETA_USUARIO / "conector_visto.txt").exists()
+
+
+def marcar_conector_visto(version):
+    try:
+        CARPETA_USUARIO.mkdir(parents=True, exist_ok=True)
+        (CARPETA_USUARIO / "conector_visto.txt").write_text(f"{datetime.now():%Y-%m-%d %H:%M} {version}",
+                                                            encoding="utf-8")
+    except OSError:
+        pass
+
+
+CONECTOR = ConectorChrome()   # uno solo por programa; se inicia al abrir la ventana
+
+
 class VURClient:
     def __init__(self, log, notificar=lambda estado: None):
         self.log = log
@@ -1053,8 +1331,22 @@ class VURClient:
     # --- Navegador ---------------------------------------------------------
 
     def iniciar_navegador(self):
-        """Abre (o reutiliza) un Chrome normal y se conecta a él; si no se puede, usa el modo anterior."""
+        """Prefiere el conector (pestaña en el Chrome del usuario). Si no está instalado, abre
+        (o reutiliza) un Chrome normal aparte; si tampoco se puede, usa el modo anterior."""
         self._proceso = None
+        if CONECTOR.conectado() or conector_conocido():
+            self.modo = "conector"
+            self.driver = CONECTOR
+            if not CONECTOR.conectado():
+                self.log("Abriendo VUR en una pestaña de su Chrome (conector)...")
+                CONECTOR.get(URL_INICIO)
+            if CONECTOR.conectado():
+                self.log("Conector VUR activo: se trabaja en una pestaña de su Chrome.")
+                self.driver.set_script_timeout(TIMEOUT_API)
+                self.notificar("esperando")
+                return
+            self.log("El conector no respondió (¿extensión desactivada?); se abre Chrome aparte.")
+            self.driver = None
         self.modo = "normal"
         try:
             self._conectar_chrome_normal()
@@ -1142,6 +1434,10 @@ class VURClient:
         self.paralelo = CONSULTAS_PARALELAS
 
     def cerrar_navegador(self):
+        if getattr(self, "modo", "") == "conector":   # la pestaña es del usuario: no se cierra nada
+            self.driver = None
+            self.notificar("cerrada")
+            return
         if self.driver:
             try:
                 if getattr(self, "modo", "prueba") == "normal" and not getattr(self, "_proceso", None):
@@ -1163,6 +1459,9 @@ class VURClient:
 
     def vivo(self):
         if not self.driver:
+            if CONECTOR.conectado() and getattr(self, "modo", "") == "conector":
+                self.driver = CONECTOR   # el usuario volvió a abrir la pestaña de VUR
+                return True
             return False
         try:
             _ = self.driver.window_handles
@@ -2464,6 +2763,10 @@ class App:
         self.n_historico = 0
         self._construir_ui()
         self._construir_menu()
+        if CONECTOR.iniciar():
+            self.root.after(3000, self._revisar_conector)
+        else:
+            self._log(f"Conector: el puerto {PUERTO_CONECTOR} está ocupado (¿hay otra ventana del programa abierta?).")
         colorear_barra_titulo(self.root)
         icono = CARPETA_RECURSOS / "icono_vur.ico"
         if icono.exists():
@@ -2733,12 +3036,60 @@ class App:
         barra = tk.Menu(self.root)
         ayuda = tk.Menu(barra, tearoff=0)
         ayuda.add_command(label="Buscar actualización", command=lambda: self._buscar_actualizacion(manual=True))
+        ayuda.add_command(label="Instalar conector de Chrome (VUR en una pestaña)", command=self._instalar_conector)
         ayuda.add_command(label="Abrir registro del proceso (archivo)", command=self._abrir_registro)
         ayuda.add_separator()
         ayuda.add_command(label="Acerca de", accelerator="F1", command=self._acerca_de)
         barra.add_cascade(label="Ayuda", menu=ayuda)
         self.root.configure(menu=barra)
         self.root.bind("<F1>", lambda e: self._acerca_de())
+
+    def _revisar_conector(self):
+        """Cada 3 s: registra la primera vez que la extensión se reporta y avisa si está desactualizada."""
+        try:
+            if CONECTOR.conectado():
+                if not conector_conocido():
+                    marcar_conector_visto(CONECTOR.version_extension)
+                    self._log("Conector VUR detectado: desde ahora VUR se usa en una pestaña de su Chrome.")
+                if (CONECTOR.version_extension and version_tupla(CONECTOR.version_extension)
+                        < version_tupla(VERSION_CONECTOR) and not getattr(self, "_aviso_conector", False)):
+                    self._aviso_conector = True
+                    preparar_conector()
+                    messagebox.showinfo("Conector VUR", "Hay una versión nueva del conector. En chrome://extensions, "
+                                        "pulse el botón de recargar (flecha circular) de «Conector VUR».",
+                                        parent=self.root)
+        finally:
+            self.root.after(3000, self._revisar_conector)
+
+    def _instalar_conector(self):
+        import subprocess
+        try:
+            carpeta = preparar_conector()
+        except OSError as e:
+            messagebox.showerror("Conector VUR", f"No se pudo preparar la extensión: {e}", parent=self.root)
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(carpeta))
+        except tk.TclError:
+            pass
+        messagebox.showinfo(
+            "Instalar conector de Chrome",
+            "Con el conector, VUR se abre en una PESTAÑA de su Chrome normal, sin ventanas aparte.\n\n"
+            "1. Se abrirá Chrome en chrome://extensions.\n"
+            "2. Active «Modo de desarrollador» (arriba a la derecha).\n"
+            "3. Pulse «Cargar extensión sin empaquetar» y elija esta carpeta (ya quedó copiada; puede "
+            f"pegarla con Ctrl+V en la barra de la ventana):\n{carpeta}\n"
+            "4. Abra VUR en una pestaña de su Chrome. El programa lo detectará solo.\n\n"
+            "La extensión solo se comunica con este equipo (127.0.0.1) y solo trabaja en páginas de VUR.",
+            parent=self.root)
+        exe = ruta_chrome()
+        if exe:
+            subprocess.Popen([exe, "chrome://extensions"])
+        try:
+            os.startfile(carpeta)  # solo Windows: abre la carpeta para verla
+        except (AttributeError, OSError):
+            pass
 
     def _abrir_registro(self):
         if not ARCHIVO_REGISTRO.exists():
@@ -2773,8 +3124,10 @@ class App:
             ("Carpeta de trabajo", str(CARPETA_CONSULTAS.parent if CARPETA_CONSULTAS.name == "consultas"
                                        else CARPETA_CONSULTAS)),
             ("Histórico", str(self.historico.carpeta) if getattr(self, "historico", None) else "—"),
-            ("Chrome", "modo normal" if getattr(self.cliente, "modo", "") == "normal" else
-                       "modo de prueba" if self.cliente and self.cliente.driver else "cerrado"),
+            ("Chrome", {"conector": "pestaña en su Chrome (conector)", "normal": "ventana aparte",
+                        "prueba": "ventana aparte (modo de prueba)"}.get(getattr(self.cliente, "modo", ""), "cerrado")
+                       + (f" · conector {CONECTOR.version_extension} activo" if CONECTOR.conectado() else
+                          " · conector instalado" if conector_conocido() else " · conector no instalado")),
             ("Entorno", f"Python {platform.python_version()} · Selenium {selenium.__version__} · "
                         f"{platform.system()} {platform.release()}"),
         ]
@@ -3228,6 +3581,7 @@ class App:
             self.hilo.join(timeout=5)
         if self.cliente:
             self.cliente.cerrar_navegador()  # evita dejar Chrome abierto al cerrar la ventana
+        CONECTOR.detener()
         self.root.destroy()
 
     # --- Hilo de trabajo ----------------------------------------------------
@@ -4279,6 +4633,65 @@ def ejecutar_autopruebas():
                     return  # Windows sin permiso para crear enlaces: esa parte solo aplica a Linux/macOS
                 self.assertTrue(v.perfil_en_uso(d))           # Chrome abierto (Linux)
 
+    class Conector(unittest.TestCase):
+        def test_identificador_sale_de_la_clave_del_manifiesto(self):
+            import base64
+            import hashlib
+            manifiesto = json.loads(v.EXTENSION_CHROME["manifest.json"])
+            resumen = hashlib.sha256(base64.b64decode(manifiesto["key"])).hexdigest()[:32]
+            self.assertEqual("".join("abcdefghijklmnop"[int(x, 16)] for x in resumen), v.ID_CONECTOR)
+            self.assertEqual(manifiesto["version"], v.VERSION_CONECTOR)
+            self.assertIn(f"127.0.0.1:{v.PUERTO_CONECTOR}", v.EXTENSION_CHROME["background.js"])
+
+        def test_puente_con_la_extension(self):
+            import socket
+            import urllib.error
+            import urllib.request
+            with socket.socket() as libre:
+                libre.bind(("127.0.0.1", 0))
+                puerto = libre.getsockname()[1]
+            origen = "chrome-extension://prueba"
+            c = v.ConectorChrome(puerto=puerto, origen=origen)
+            self.assertTrue(c.iniciar())
+            try:
+                def enviar(ruta, datos, de=origen):
+                    q = urllib.request.Request(f"http://127.0.0.1:{puerto}{ruta}", data=json.dumps(datos).encode(),
+                                               headers={"Origin": de, "Content-Type": "application/json"})
+                    directo = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # sin proxy del equipo
+                    with directo.open(q, timeout=25) as r:
+                        return json.loads(r.read())
+
+                with self.assertRaises(urllib.error.HTTPError):   # otra página no puede hablarle al programa
+                    enviar("/sondeo", {}, de="https://pagina-ajena.com")
+                self.assertFalse(c.conectado())
+                with self.assertRaises(v.WebDriverException):
+                    _ = c.window_handles
+
+                def extension_falsa():
+                    for _ in range(2):
+                        t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.0.0"}).get("trabajo")
+                        if t:
+                            datos = [{"status": 200, "url": u, "tipo": "application/json", "texto": "{}"}
+                                     for u in t["urls"]]
+                            enviar("/resultado", {"id": t["id"], "datos": datos})
+                hilo = threading.Thread(target=extension_falsa, daemon=True)
+                hilo.start()
+                import time
+                for _ in range(100):
+                    if c.conectado():
+                        break
+                    time.sleep(0.05)
+                self.assertEqual((c.window_handles, c.current_url, c.version_extension), (["vur"], v.URL_INICIO, "1.0.0"))
+                r = c.execute_async_script(v.JS_FETCH, "https://www.vur.gov.co/a")
+                self.assertEqual(r["url"], "https://www.vur.gov.co/a")
+                rs = c.execute_async_script(v.JS_FETCH_VARIOS, ["https://www.vur.gov.co/b", "https://www.vur.gov.co/c"], 3)
+                self.assertEqual([x["url"] for x in rs], ["https://www.vur.gov.co/b", "https://www.vur.gov.co/c"])
+                with self.assertRaises(v.JavascriptException):   # no ejecuta código arbitrario
+                    c.execute_async_script("return 1")
+                hilo.join(5)
+            finally:
+                c.detener()
+
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
     cargador = unittest.TestLoader()
@@ -4296,6 +4709,302 @@ def ejecutar_autopruebas():
 # en OFL-Poppins.txt, que se recrea junto a las fuentes).
 
 RECURSOS = {
+    "conector_icono128.png": """
+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
+""",
     "logo_gobernacion_app.png": """
 iVBORw0KGgoAAAANSUhEUgAAAJ0AAABGCAYAAADW35Y6AAAtIUlEQVR42u19eZhcR3Xv75yqe3uZnn3R7D1Lz6LR7jGObWxkG7yw
 2WZRbJL4BcIWEuCFhwPEEMYKEGMgJsQQB8IXAmQxFg48drDBVmy8Im+ytbZGmtGMpNFo9t5u36o674+ekcbCBhO+F95jdL6ve6bv
