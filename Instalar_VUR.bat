@@ -102,16 +102,28 @@ if (-not $py) {
 Write-Host "       Python listo: $(& $py --version)"
 
 # ---- 3. Programa ------------------------------------------------------------------
+# Se usa la version MAS NUEVA entre la del ZIP descargado y la publicada en GitHub
+# (un ZIP viejo ya no instala una version vieja).
 Paso 3 'Programa'
-$nuevo = Join-Path $env:VUR_ORIGEN 'vur_valorizacion.py'
-if (Test-Path $nuevo) {
-    Write-Host '       Se usa vur_valorizacion.py del ZIP descargado.'
-} else {
-    Aviso 'No se encontro vur_valorizacion.py junto al instalador (el ZIP no se extrajo); se descarga de GitHub.'
-    $nuevo = Join-Path $env:TEMP 'vur_valorizacion_descargado.py'
-    try { Invoke-WebRequest -UseBasicParsing -Uri $UrlPrograma -OutFile $nuevo }
-    catch { Falla "No se pudo descargar el programa: $($_.Exception.Message). Extraiga el ZIP completo y ejecute el instalador desde esa carpeta." }
+function Leer-Version($ruta) {
+    $m = Select-String -Path $ruta -Pattern '^VERSION_APLICATIVO = "([^"]+)"' -List
+    if ($m) { return $m.Matches[0].Groups[1].Value } else { return $null }
 }
+function Como-Version($v) { try { return [version](($v -replace '-', '.')) } catch { return [version]'0.0' } }
+$nuevo = $null; $versionNueva = $null
+$local = Join-Path $env:VUR_ORIGEN 'vur_valorizacion.py'
+if (Test-Path $local) { $nuevo = $local; $versionNueva = Leer-Version $local; Write-Host "       Version en el ZIP: $versionNueva" }
+$web = Join-Path $env:TEMP 'vur_valorizacion_descargado.py'
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri $UrlPrograma -OutFile $web -Headers @{ 'Cache-Control' = 'no-cache' }
+    $versionWeb = Leer-Version $web
+    Write-Host "       Version publicada en GitHub: $versionWeb"
+    if ($versionWeb -and (-not $versionNueva -or (Como-Version $versionWeb) -gt (Como-Version $versionNueva))) {
+        $nuevo = $web; $versionNueva = $versionWeb
+    }
+} catch { Aviso "No se pudo consultar GitHub ($($_.Exception.Message)); se usa la version del ZIP." }
+if (-not $nuevo) { Falla 'No se encontro el programa: extraiga el ZIP completo o revise la conexion a internet.' }
+Write-Host "       Se instalara la version $versionNueva."
 
 # ---- 4. Instalar (respaldando lo anterior) ------------------------------------------
 Paso 4 'Instalando archivos'

@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-3"
+VERSION_APLICATIVO = "2026.10.30-4"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -912,6 +912,96 @@ def puerto_abierto(puerto, espera=0.3):
             return True
     except OSError:
         return False
+
+# ---------------------------------------------------------------------------
+# Actualización automática desde GitHub
+# ---------------------------------------------------------------------------
+# Al abrir y cada REVISAR_ACTUALIZACION_HORAS horas el programa mira qué versión está
+# publicada. Si es más nueva, pregunta al usuario; si acepta, la descarga, verifica que
+# sea Python válido y que pasen TODAS las pruebas automáticas, guarda la versión actual
+# en respaldos y se reinicia. Si algo falla, no cambia nada. Cuando el repositorio deje
+# de ser público (lanzamiento oficial), basta con cambiar URL_PROGRAMA.
+URL_PROGRAMA = "https://raw.githubusercontent.com/alexandergomezsif/VUR_AUTOMATIZACION_GOBANT/main/vur_valorizacion.py"
+REVISAR_ACTUALIZACION_HORAS = 4
+
+
+def version_tupla(version):
+    """'2026.10.30-3' -> (2026, 10, 30, 3) para comparar versiones."""
+    return tuple(int(n) for n in re.findall(r"\d+", version or ""))
+
+
+def _leer_url(url, limite=None, timeout=15):
+    import urllib.request
+    cabeceras = {"User-Agent": f"VUR-Valorizacion/{VERSION_APLICATIVO}", "Cache-Control": "no-cache"}
+    if limite:
+        cabeceras["Range"] = f"bytes=0-{limite}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=cabeceras), timeout=timeout) as r:
+        return r.read() if not limite else r.read(limite + 1)
+
+
+def version_en_texto(texto):
+    m = re.search(r'^VERSION_APLICATIVO = "([^"]+)"', texto, re.M)
+    return m.group(1) if m else None
+
+
+def version_publicada():
+    """Versión publicada en GitHub (lee solo el comienzo del archivo) o None si no hay conexión."""
+    try:
+        return version_en_texto(_leer_url(URL_PROGRAMA, limite=30000, timeout=8).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - sin internet o GitHub bloqueado: simplemente no se ofrece
+        return None
+
+
+def validar_programa(ruta, probar=True):
+    """Comprueba un vur_valorizacion.py descargado. Devuelve (ok, explicación)."""
+    import subprocess
+    import sys
+    try:
+        texto = Path(ruta).read_text(encoding="utf-8")
+        compile(texto, str(ruta), "exec")
+    except (OSError, UnicodeDecodeError, SyntaxError) as e:
+        return False, f"el archivo descargado no es válido ({type(e).__name__})"
+    if not version_en_texto(texto):
+        return False, "el archivo descargado no indica su versión"
+    if not probar:
+        return True, "válido"
+    python = Path(sys.executable)
+    if python.name.lower() == "pythonw.exe" and python.with_name("python.exe").exists():
+        python = python.with_name("python.exe")
+    try:
+        r = subprocess.run([str(python), str(ruta), "--probar"], capture_output=True, text=True, timeout=300,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"no se pudieron ejecutar las pruebas ({type(e).__name__})"
+    if "TODAS LAS PRUEBAS PASARON" not in (r.stdout or "") + (r.stderr or ""):
+        return False, "la versión nueva no pasó las pruebas automáticas en este equipo"
+    return True, "pasó las pruebas automáticas"
+
+
+def instalar_actualizacion(log=lambda m: None):
+    """Descarga, valida y reemplaza este archivo. Devuelve (ok, explicación)."""
+    actual = Path(__file__).resolve()
+    temporal = actual.with_name("~vur_valorizacion_nuevo.py")
+    try:
+        temporal.write_bytes(_leer_url(URL_PROGRAMA, timeout=60))
+    except Exception as e:  # noqa: BLE001
+        return False, f"no se pudo descargar ({type(e).__name__})"
+    log("Actualización descargada; ejecutando las pruebas automáticas de la versión nueva...")
+    ok, motivo = validar_programa(temporal)
+    if not ok:
+        try:
+            temporal.unlink()
+        except OSError:
+            pass
+        return False, motivo
+    respaldo = CARPETA_RAIZ / "respaldos"
+    try:
+        respaldo.mkdir(parents=True, exist_ok=True)
+        (respaldo / f"vur_valorizacion_{VERSION_APLICATIVO}.py").write_bytes(actual.read_bytes())
+        os.replace(temporal, actual)
+    except OSError as e:
+        return False, f"no se pudo reemplazar el programa ({type(e).__name__})"
+    return True, f"instalada; la versión anterior quedó en respaldos\\vur_valorizacion_{VERSION_APLICATIVO}.py"
 
 
 class VURClient:
@@ -2351,6 +2441,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._al_cerrar)
         self.root.after(100, self._procesar_cola)
         self.root.after(1000, self._vigilar_sesion)
+        self._version_ofrecida = None   # para no insistir con la misma versión en esta sesión
+        self.root.after(6000, self._buscar_actualizacion)
 
     # --- Apariencia ------------------------------------------------------------
 
@@ -2448,8 +2540,10 @@ class App:
                  font=self.f_mini).pack(side="left")
         tk.Label(pie, text=CREDITO, bg=c["fondo"], fg=c["verde_oscuro"],
                  font=self.f_pequena_negrita).pack(side="right")
-        tk.Label(pie, text=f"Versión {VERSION_APLICATIVO}   ·", bg=c["fondo"], fg=c["texto_suave"],
-                 font=self.f_mini).pack(side="right", padx=(0, 6))
+        self.lbl_version = tk.Label(pie, text=f"Versión {VERSION_APLICATIVO} · buscar actualización   ·",
+                                    bg=c["fondo"], fg=c["texto_suave"], font=self.f_mini, cursor="hand2")
+        self.lbl_version.pack(side="right", padx=(0, 6))
+        self.lbl_version.bind("<Button-1>", lambda e: self._buscar_actualizacion(manual=True))
 
         cuerpo = tk.Frame(self.root, bg=c["fondo"])
         cuerpo.pack(fill="both", expand=True, padx=12, pady=(6, 0))
@@ -2594,6 +2688,53 @@ class App:
         if sel:
             self._fila_marcada = (sel[0], self.tabla.item(sel[0], "tags"))
             self.tabla.item(sel[0], tags=("seleccion",))
+
+    def _buscar_actualizacion(self, manual=False):
+        """Consulta en segundo plano la versión publicada; el resultado llega por la cola."""
+        if not manual:
+            self.root.after(REVISAR_ACTUALIZACION_HORAS * 3600 * 1000, self._buscar_actualizacion)
+        threading.Thread(target=lambda: self.cola.put(("version", (version_publicada(), manual))),
+                         daemon=True).start()
+
+    def _ofrecer_actualizacion(self, publicada, manual):
+        if not publicada:
+            if manual:
+                messagebox.showinfo("Actualización", "No se pudo consultar la versión publicada (sin internet o "
+                                    "GitHub bloqueado).", parent=self.root)
+            return
+        if version_tupla(publicada) <= version_tupla(VERSION_APLICATIVO):
+            if manual:
+                messagebox.showinfo("Actualización", f"Ya tiene la última versión ({VERSION_APLICATIVO}).",
+                                    parent=self.root)
+            return
+        if self.hilo and self.hilo.is_alive():
+            self.root.after(60000, lambda: self._ofrecer_actualizacion(publicada, manual))  # al terminar el proceso
+            return
+        if publicada == self._version_ofrecida and not manual:
+            return
+        self._version_ofrecida = publicada
+        self.lbl_version.configure(text=f"Versión {VERSION_APLICATIVO} · HAY ACTUALIZACIÓN {publicada}   ·",
+                                   fg=COLOR["naranja"])
+        if not messagebox.askyesno("Actualización disponible",
+                                   f"Hay una versión nueva del programa: {publicada}\n(usted tiene {VERSION_APLICATIVO}).\n\n"
+                                   "¿Actualizar ahora? Se descarga, se verifica con las pruebas automáticas y el "
+                                   "programa se reinicia. Sus consultas e histórico no se tocan.", parent=self.root):
+            return
+        self.root.configure(cursor="watch")
+        self.root.update()
+        ok, motivo = instalar_actualizacion(self._log)
+        self.root.configure(cursor="")
+        self._log(f"Actualización a {publicada}: {motivo}")
+        if not ok:
+            messagebox.showwarning("Actualización", f"No se actualizó: {motivo}.\nSigue usando la versión "
+                                   f"{VERSION_APLICATIVO}.", parent=self.root)
+            return
+        messagebox.showinfo("Actualización", f"Versión {publicada} {motivo}.\n\nEl programa se reiniciará.",
+                            parent=self.root)
+        import subprocess
+        import sys
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(CARPETA_RAIZ))
+        self._al_cerrar()
 
     def _notificar_sesion(self, estado):
         """Llamado desde el hilo de consultas: el cambio se pinta en el hilo de la ventana."""
@@ -2787,6 +2928,8 @@ class App:
                     self._log(dato)
                 elif tipo == "sesion":
                     self._estado_sesion(dato)
+                elif tipo == "version":
+                    self._ofrecer_actualizacion(*dato)
                 elif tipo == "progreso":
                     hechas, consultas, reutilizadas, del_historico = dato
                     total = len(self.df) if self.df is not None else 0
@@ -3983,6 +4126,25 @@ def ejecutar_autopruebas():
             r = consultar({"020-1": db_basico("RIONEGRO")}, {"020-1": {"textoAnotaciones": [COMPRA, raro]}}, "020", "1")
             self.assertEqual((r["Estado"], r["Confiabilidad"]), ("GRAVADA", "REVISAR"))
             self.assertIn("no se identificó si la valorización es departamental", r["Motivos_Revision"])
+
+    class Actualizacion(unittest.TestCase):
+        def test_comparar_versiones(self):
+            self.assertGreater(v.version_tupla("2026.10.30-4"), v.version_tupla("2026.10.30-3"))
+            self.assertGreater(v.version_tupla("2026.11.1-1"), v.version_tupla("2026.10.30-9"))
+            self.assertEqual(v.version_en_texto('x\nVERSION_APLICATIVO = "2026.10.30-4"\n'), "2026.10.30-4")
+
+        def test_validar_rechaza_archivos_malos(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                malo = Path(d) / "a.py"
+                malo.write_text("def roto(:\n", encoding="utf-8")
+                self.assertFalse(v.validar_programa(malo, probar=False)[0])
+                sin_version = Path(d) / "b.py"
+                sin_version.write_text("x = 1\n", encoding="utf-8")
+                self.assertFalse(v.validar_programa(sin_version, probar=False)[0])
+                bueno = Path(d) / "c.py"
+                bueno.write_text('VERSION_APLICATIVO = "2026.12.1-1"\n', encoding="utf-8")
+                self.assertTrue(v.validar_programa(bueno, probar=False)[0])
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]

@@ -21,8 +21,11 @@ Desarrollado por Alexander Gómez A. · Versión BETA
    5. ejecuta las pruebas automáticas.
 5. Al terminar puede borrar el ZIP y la carpeta extraída.
 
-**Actualizar:** descargue el ZIP nuevo y ejecute otra vez `Instalar_VUR.bat`. No borra consultas
-ni histórico, y guarda la versión anterior en `respaldos`.
+**Actualizar:** el programa revisa solo, al abrirse y cada 4 horas, si hay una versión nueva en GitHub.
+Si la hay, pregunta; al aceptar la descarga, la verifica con las pruebas automáticas, guarda la anterior
+en `respaldos` y se reinicia. También se puede buscar a mano con el enlace «buscar actualización» del
+pie de la ventana. El instalador, aunque se ejecute desde un ZIP viejo, instala la versión más nueva
+entre la del ZIP y la publicada.
 
 **Requisitos:** Windows 10 u 11, Google Chrome, internet, permiso para ejecutar PowerShell y un
 usuario propio de VUR.
