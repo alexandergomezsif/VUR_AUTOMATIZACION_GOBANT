@@ -121,7 +121,7 @@ COLUMNAS_SALIDA = [
     "Direccion_Inmueble", "Matricula_VUR", "Referencia_Catastral", "Departamento", "Municipio",
     "Nupre", "Tipo_Predio", "Estado_Folio", "Fecha_Apertura_Folio", "Matriculas_Matriz",
     "Clasificacion_Municipio", "Proyectos_Municipio", "Fecha_Limite_Revision",
-    "Estado", "Confiabilidad", "Motivos_Revision", "Segunda_Pasada",
+    "Estado", "Ente_Valorizacion", "Confiabilidad", "Motivos_Revision", "Segunda_Pasada",
     "Matricula_Con_Anotacion", "Nivel_Matriz", "Detalle_Valorizacion", "Propietario_Gravado",
     "Matricula_Cancelacion", "Observaciones", "Afectaciones_Valorizacion", "Valorizacion_Otros_Entes",
     "Cadena_Revisada", "Folios_Revisados", "Notas_Proceso", "Intentos", "Fecha_Consulta", "Version_Aplicativo",
@@ -133,7 +133,7 @@ COLUMNAS_SALIDA = [
 # luego lo que ellos usan; el resto queda AGRUPADO y oculto (botón [+] encima de las
 # columnas). No se elimina: lo usan el histórico, "Comparar" y la trazabilidad.
 COLUMNAS_VISIBLES = [
-    "Matricula_Original", "Resultado", "Confiabilidad", "Motivos_Revision", "Estado",
+    "Matricula_Original", "Resultado", "Confiabilidad", "Motivos_Revision", "Estado", "Ente_Valorizacion",
     "Matricula_Con_Anotacion", "Nivel_Matriz", "Matricula_Cancelacion", "Propietario_Gravado", "Municipio",
     "Propietario", "Tipo_Identificacion", "Numero_Identificacion", "Propietarios_Actuales",
     "Observaciones", "Afectaciones_Valorizacion", "Valorizacion_Otros_Entes", "Cadena_Revisada",
@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-1"
+VERSION_APLICATIVO = "2026.10.30-2"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -467,9 +467,10 @@ def analizar_folio(anotaciones):
 # ---------------------------------------------------------------------------
 # Solo interesa a la Gobernación la valorización DEPARTAMENTAL. La MUNICIPAL (p. ej.
 # 020-0036604, "MUNICIPIO DE RIONEGRO") se informa en la columna Valorizacion_Otros_Entes,
-# pero no define el estado ni detiene la búsqueda en las matrices. La NACIONAL (INVIAS) y
-# la de ente no reconocido se tratan como departamentales por precaución y se piden
-# revisar, hasta que el área confirme si aplican. Palabras tomadas de las anotaciones reales del histórico (28/10/2026).
+# pero no define el estado ni detiene la búsqueda en las matrices. La NACIONAL (INVIAS)
+# SÍ compete a la Gobernación, aunque con otro tipo de paz y salvo (confirmado por el área
+# el 30/10/2026): cuenta igual y el resultado dice "INVIAS". La de ente no reconocido se
+# trata como departamental por precaución y se pide revisar. Palabras tomadas de las anotaciones reales del histórico (28/10/2026).
 ENTE_DEPARTAMENTAL, ENTE_MUNICIPAL, ENTE_NACIONAL, ENTE_DESCONOCIDO = (
     "DEPARTAMENTAL", "MUNICIPAL", "NACIONAL", "SIN IDENTIFICAR")
 _ENTES = (
@@ -1218,9 +1219,9 @@ ESTILO_ESTADO = {
 
 
 CONCLUSIONES = {
-    "GRAVADA": "TIENE VALORIZACIÓN DEPARTAMENTAL VIGENTE",
-    "GRAVAMEN CANCELADO": "TUVO VALORIZACIÓN DEPARTAMENTAL, YA CANCELADA",
-    "NO GRAVADA": "NO TIENE VALORIZACIÓN DEPARTAMENTAL",
+    "GRAVADA": "TIENE VALORIZACIÓN {tipo} VIGENTE",
+    "GRAVAMEN CANCELADO": "TUVO VALORIZACIÓN {tipo}, YA CANCELADA",
+    "NO GRAVADA": "NO TIENE VALORIZACIÓN DEPARTAMENTAL NI INVIAS",
     ESTADO_INCOMPLETO: "NO SE HALLÓ VALORIZACIÓN, PERO LA REVISIÓN DE MATRICES QUEDÓ INCOMPLETA",
     "SIN DATOS EN VUR": "NO SE PUDO CONSULTAR (VUR SIN DATOS)",
     "ERROR": "NO SE PUDO CONSULTAR (ERROR)",
@@ -1231,11 +1232,17 @@ CONCLUSIONES = {
 def conclusion(reg):
     """Frase concluyente de la primera columna del Excel."""
     estado = reg.get("Estado", "")
-    texto = CONCLUSIONES.get(estado, estado or "SIN RESULTADO")
+    ente = reg.get("Ente_Valorizacion") or ""
+    invias = "INVIAS" in ente
+    departamental = not invias or ENTE_DEPARTAMENTAL in ente or ENTE_DESCONOCIDO in ente
+    tipo = "DEPARTAMENTAL E INVIAS" if invias and departamental else "INVIAS" if invias else "DEPARTAMENTAL"
+    texto = CONCLUSIONES.get(estado, estado or "SIN RESULTADO").replace("{tipo}", tipo)
     folio, nivel = reg.get("Matricula_Con_Anotacion"), str(reg.get("Nivel_Matriz", "")).strip()
     if folio and estado in ("GRAVADA", "GRAVAMEN CANCELADO"):
         texto += (" · anotación en la misma matrícula" if nivel in ("", "0")
                   else f" · anotación en la matriz {folio} (nivel {nivel})")
+    if invias and estado in ("GRAVADA", "GRAVAMEN CANCELADO"):
+        texto += " · paz y salvo INVIAS (otro tipo)"
     otros = reg.get("Valorizacion_Otros_Entes") or ""
     if otros:
         texto += " · además hay valorización municipal (informativa)"
@@ -3192,9 +3199,6 @@ class App:
             if ente_valorizacion(a) == ENTE_DESCONOCIDO:
                 motivos.append(f"Anotación {a['nro']}: no se identificó si la valorización es departamental "
                                "(se tomó como departamental por precaución)")
-            elif ente_valorizacion(a) == ENTE_NACIONAL:
-                motivos.append(f"Anotación {a['nro']}: valorización NACIONAL (INVIAS); confirmar si aplica para el "
-                               "paz y salvo departamental")
             if tipo_valorizacion(a) == "dudosa":
                 motivos.append(f"Anotación {a['nro']}: código de valorización no reconocido ({_codigo(a['especificacion']) or 'sin código'})")
             textos.append(f"{r['matricula']} - {a['texto']}{marca}")
@@ -3219,6 +3223,10 @@ class App:
             motivos.append("Revisión de matrices incompleta")
         if r["estado"] == "GRAVAMEN CANCELADO" and not r["valorizacion"]:
             motivos.append("Se halló la cancelación pero no el gravamen original")
+        entes = {ente_valorizacion(a) for a in list(r["valorizacion"]) + list(r["cancelaciones"])}
+        registro["Ente_Valorizacion"] = ", ".join(
+            "NACIONAL (INVIAS)" if e == ENTE_NACIONAL else e
+            for e in (ENTE_DEPARTAMENTAL, ENTE_NACIONAL, ENTE_DESCONOCIDO) if e in entes)
         otros = []
         for folio, a, ente in r.get("otros_entes", []):
             quien = "; ".join(limpiar_persona(p) for p in a["de"]) or "ente no indicado"
@@ -3689,7 +3697,7 @@ def ejecutar_autopruebas():
         """Pedido de los profesionales (27/10/2026): las primeras columnas deben ser concluyentes."""
 
         def test_conclusion(self):
-            self.assertEqual(v.conclusion({"Estado": "NO GRAVADA", "Confiabilidad": "ALTA"}), "NO TIENE VALORIZACIÓN DEPARTAMENTAL")
+            self.assertEqual(v.conclusion({"Estado": "NO GRAVADA", "Confiabilidad": "ALTA"}), "NO TIENE VALORIZACIÓN DEPARTAMENTAL NI INVIAS")
             t = v.conclusion({"Estado": "GRAVAMEN CANCELADO", "Matricula_Con_Anotacion": "01N-5052127",
                               "Nivel_Matriz": 3, "Confiabilidad": "REVISAR"})
             self.assertEqual(t, "TUVO VALORIZACIÓN DEPARTAMENTAL, YA CANCELADA · anotación en la matriz 01N-5052127 (nivel 3)"
@@ -3870,12 +3878,17 @@ def ejecutar_autopruebas():
             self.assertEqual((r["Estado"], r["Matricula_Con_Anotacion"]), ("GRAVADA", "020-2"))
             self.assertIn("020-1", r["Valorizacion_Otros_Entes"])
 
-        def test_nacional_se_revisa(self):
+        def test_invias_compete_con_otro_paz_y_salvo(self):
             inv = an(3, "23-07-2001", "0212 VALORIZACION (GRAVAMEN)", ["DE: INVIAS", "A: TITULAR FICTICIO"])
             r = consultar({"024-1": db_basico("SANTA FE DE ANTIOQUIA")}, {"024-1": {"textoAnotaciones": [COMPRA, inv]}},
                           "024", "1")
-            self.assertEqual((r["Estado"], r["Confiabilidad"]), ("GRAVADA", "REVISAR"))
-            self.assertIn("valorización NACIONAL", r["Motivos_Revision"])
+            self.assertEqual((r["Estado"], r["Confiabilidad"], r["Ente_Valorizacion"]),
+                             ("GRAVADA", "ALTA", "NACIONAL (INVIAS)"))
+            self.assertEqual(v.conclusion(r), "TIENE VALORIZACIÓN INVIAS VIGENTE · anotación en la misma matrícula"
+                                              " · paz y salvo INVIAS (otro tipo)")
+            r2 = consultar({"024-1": db_basico("SANTA FE DE ANTIOQUIA")},
+                           {"024-1": {"textoAnotaciones": [COMPRA, inv, VAL_430]}}, "024", "1")
+            self.assertIn("DEPARTAMENTAL E INVIAS", v.conclusion(r2))
 
         def test_ente_desconocido_se_toma_departamental_y_revisa(self):
             raro = an(5, "01-01-2001", "430 VALORIZACION (GRAVAMEN)", ["DE: FIDUCIARIA FICTICIA S.A.", "A: TITULAR FICTICIO"])
