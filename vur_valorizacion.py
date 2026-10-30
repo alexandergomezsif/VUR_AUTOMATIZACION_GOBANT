@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-2"
+VERSION_APLICATIVO = "2026.10.30-3"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -884,6 +884,35 @@ async function trabajador() {
 Promise.all(Array.from({length: Math.min(limite, urls.length)}, trabajador)).then(() => listo(res));
 """
 
+# Chrome NORMAL en vez de "controlado por software de prueba": el programa abre Chrome
+# como lo abriría el usuario (con el perfil del aplicativo y un puerto de depuración solo
+# en este equipo, 127.0.0.1) y se conecta a él. Así no aparece la barra de "software de
+# prueba", Chrome ofrece guardar la clave de VUR y, si ese Chrome ya estaba abierto, el
+# programa trabaja en una pestaña nueva sin tocar las demás. Si la política del equipo
+# no lo permite, se usa el modo anterior.
+PUERTO_CHROME = 9333
+
+
+def ruta_chrome():
+    """chrome.exe instalado (Windows) o el Chrome/Chromium del sistema."""
+    import shutil
+    for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        base = os.environ.get(variable)
+        if base:
+            candidato = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+            if candidato.is_file():
+                return str(candidato)
+    return shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("chromium")
+
+
+def puerto_abierto(puerto, espera=0.3):
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", puerto), timeout=espera):
+            return True
+    except OSError:
+        return False
+
 
 class VURClient:
     def __init__(self, log, notificar=lambda estado: None):
@@ -900,6 +929,56 @@ class VURClient:
     # --- Navegador ---------------------------------------------------------
 
     def iniciar_navegador(self):
+        """Abre (o reutiliza) un Chrome normal y se conecta a él; si no se puede, usa el modo anterior."""
+        self._proceso = None
+        self.modo = "normal"
+        try:
+            self._conectar_chrome_normal()
+        except Exception as e:  # noqa: BLE001 - cualquier falla aquí tiene un plan B
+            self.log(f"No se pudo usar Chrome normal ({type(e).__name__}: {mensaje_corto(e)}); "
+                     "se abre en modo de prueba.")
+            if self._proceso:
+                self._proceso.terminate()
+                try:
+                    self._proceso.wait(timeout=8)  # que libere el perfil antes de abrirlo de nuevo
+                except Exception:  # noqa: BLE001
+                    pass
+                self._proceso = None
+            self.modo = "prueba"
+            self._iniciar_modo_prueba()
+        self.driver.set_script_timeout(TIMEOUT_API)
+        self.notificar("esperando")
+
+    def _conectar_chrome_normal(self):
+        import subprocess
+        import time
+        ya_abierto = puerto_abierto(PUERTO_CHROME)
+        if not ya_abierto:
+            exe = ruta_chrome()
+            if not exe:
+                raise FileNotFoundError("no se encontró chrome.exe")
+            PERFIL_CHROME.mkdir(parents=True, exist_ok=True)
+            self._proceso = subprocess.Popen([
+                exe, f"--remote-debugging-port={PUERTO_CHROME}", "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={PERFIL_CHROME}", "--no-first-run", "--no-default-browser-check",
+                "--start-maximized", "about:blank"])
+            for _ in range(60):  # hasta 15 s para que Chrome abra el puerto
+                if puerto_abierto(PUERTO_CHROME):
+                    break
+                time.sleep(0.25)
+            else:
+                raise TimeoutError("Chrome no habilitó la conexión: puede haber otra ventana de Chrome abierta "
+                                   "con el perfil de VUR (ciérrela) o una política del equipo lo impide")
+        opciones = webdriver.ChromeOptions()
+        opciones.debugger_address = f"127.0.0.1:{PUERTO_CHROME}"
+        self.driver = webdriver.Chrome(options=opciones)
+        if ya_abierto:
+            self.driver.switch_to.new_window("tab")  # pestaña propia: no se tocan las del usuario
+            self.log("Conectado al Chrome de VUR que ya estaba abierto (pestaña nueva).")
+        else:
+            self.log("Chrome abierto en modo normal (sin la barra de software de prueba).")
+
+    def _iniciar_modo_prueba(self):
         opciones = webdriver.ChromeOptions()
         opciones.add_argument(f"--user-data-dir={PERFIL_CHROME}")
         opciones.add_argument("--start-maximized")
@@ -911,8 +990,6 @@ class VURClient:
             "profile.password_manager_enabled": True,
         })
         self.driver = webdriver.Chrome(options=opciones)
-        self.driver.set_script_timeout(TIMEOUT_API)
-        self.notificar("esperando")
 
     def sesion_vigente(self):
         """Recarga la página de inicio (renueva la sesión) y revisa que VUR no pida ingresar.
@@ -939,10 +1016,21 @@ class VURClient:
     def cerrar_navegador(self):
         if self.driver:
             try:
-                self.driver.quit()
+                if getattr(self, "modo", "prueba") == "normal" and not getattr(self, "_proceso", None):
+                    # Chrome lo había abierto el usuario: solo se suelta la conexión, Chrome sigue abierto.
+                    self.driver.service.stop()
+                else:
+                    self.driver.quit()
             except WebDriverException:
                 pass
             self.driver = None
+        proceso = getattr(self, "_proceso", None)
+        if proceso:
+            try:
+                proceso.terminate()  # Chrome normal que abrió el programa
+            except OSError:
+                pass
+            self._proceso = None
         self.notificar("cerrada")
 
     def vivo(self):
