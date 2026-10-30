@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-4"
+VERSION_APLICATIVO = "2026.10.30-5"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -837,6 +837,10 @@ class NavegadorCerrado(Exception):
     pass
 
 
+class PerfilChromeOcupado(Exception):
+    """Hay un Chrome abierto con el perfil de VUR que no se abrió desde el programa."""
+
+
 class ProcesoDetenido(Exception):
     pass
 
@@ -903,6 +907,27 @@ def ruta_chrome():
             if candidato.is_file():
                 return str(candidato)
     return shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("chromium")
+
+
+def perfil_en_uso(perfil=None):
+    """True si otro Chrome tiene abierto el perfil del aplicativo (Windows: 'lockfile' bloqueado)."""
+    perfil = Path(perfil or PERFIL_CHROME)
+    bloqueo = perfil / "lockfile"
+    if bloqueo.exists():
+        try:
+            bloqueo.unlink()  # si Chrome está cerrado el archivo es un resto y se puede borrar
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    return (perfil / "SingletonLock").is_symlink()  # Linux/macOS
+
+
+MENSAJE_PERFIL_OCUPADO = (
+    "Hay una ventana de Chrome abierta con el perfil de VUR que no se abrió desde este programa "
+    "(por ejemplo, con el atajo para guardar la clave). Así el programa no puede conectarse a ella.\n\n"
+    "Cierre TODAS las ventanas de ese Chrome y vuelva a pulsar «Iniciar consultas». El programa lo "
+    "abrirá de nuevo, con su sesión y su clave guardada.")
 
 
 def puerto_abierto(puerto, espera=0.3):
@@ -1024,6 +1049,8 @@ class VURClient:
         self.modo = "normal"
         try:
             self._conectar_chrome_normal()
+        except PerfilChromeOcupado:
+            raise  # ningún modo puede abrir un perfil ocupado: se le explica al usuario
         except Exception as e:  # noqa: BLE001 - cualquier falla aquí tiene un plan B
             self.log(f"No se pudo usar Chrome normal ({type(e).__name__}: {mensaje_corto(e)}); "
                      "se abre en modo de prueba.")
@@ -1043,6 +1070,8 @@ class VURClient:
         import subprocess
         import time
         ya_abierto = puerto_abierto(PUERTO_CHROME)
+        if not ya_abierto and perfil_en_uso():
+            raise PerfilChromeOcupado(MENSAJE_PERFIL_OCUPADO)
         if not ya_abierto:
             exe = ruta_chrome()
             if not exe:
@@ -1348,6 +1377,7 @@ def primer_inicio(raiz):
         messagebox.showwarning("Carpeta de trabajo", f"No se pudo usar esa carpeta ({type(e).__name__}: {e}).\n"
                                f"Se usará {CARPETA_RAIZ}.", parent=raiz)
         return aplicar_carpeta_trabajo(CARPETA_RAIZ, guardar=True)
+ARCHIVO_REGISTRO = CARPETA_USUARIO / "registro_proceso.log"  # copia del "Registro del proceso"
 CARPETA_RECURSOS = CARPETA_USUARIO / "recursos"  # logo, icono y Poppins (licencia SIL OFL 1.1) recreados aquí
 
 
@@ -2424,6 +2454,7 @@ class App:
         self._forzar = False
         self.n_historico = 0
         self._construir_ui()
+        self._construir_menu()
         colorear_barra_titulo(self.root)
         icono = CARPETA_RECURSOS / "icono_vur.ico"
         if icono.exists():
@@ -2540,7 +2571,7 @@ class App:
                  font=self.f_mini).pack(side="left")
         tk.Label(pie, text=CREDITO, bg=c["fondo"], fg=c["verde_oscuro"],
                  font=self.f_pequena_negrita).pack(side="right")
-        self.lbl_version = tk.Label(pie, text=f"Versión {VERSION_APLICATIVO} · buscar actualización   ·",
+        self.lbl_version = tk.Label(pie, text=f"Versión {VERSION_APLICATIVO}   ·",
                                     bg=c["fondo"], fg=c["texto_suave"], font=self.f_mini, cursor="hand2")
         self.lbl_version.pack(side="right", padx=(0, 6))
         self.lbl_version.bind("<Button-1>", lambda e: self._buscar_actualizacion(manual=True))
@@ -2689,6 +2720,70 @@ class App:
             self._fila_marcada = (sel[0], self.tabla.item(sel[0], "tags"))
             self.tabla.item(sel[0], tags=("seleccion",))
 
+    def _construir_menu(self):
+        barra = tk.Menu(self.root)
+        ayuda = tk.Menu(barra, tearoff=0)
+        ayuda.add_command(label="Buscar actualización", command=lambda: self._buscar_actualizacion(manual=True))
+        ayuda.add_command(label="Abrir registro del proceso (archivo)", command=self._abrir_registro)
+        ayuda.add_separator()
+        ayuda.add_command(label="Acerca de", accelerator="F1", command=self._acerca_de)
+        barra.add_cascade(label="Ayuda", menu=ayuda)
+        self.root.configure(menu=barra)
+        self.root.bind("<F1>", lambda e: self._acerca_de())
+
+    def _abrir_registro(self):
+        if not ARCHIVO_REGISTRO.exists():
+            messagebox.showinfo("Registro", "Todavía no hay registro guardado.", parent=self.root)
+            return
+        try:
+            os.startfile(ARCHIVO_REGISTRO)  # solo Windows
+        except (AttributeError, OSError):
+            messagebox.showinfo("Registro", f"El registro está en:\n{ARCHIVO_REGISTRO}", parent=self.root)
+
+    def _acerca_de(self):
+        import platform
+        import selenium
+        c = COLOR
+        ven = tk.Toplevel(self.root)
+        ven.title("Acerca de")
+        ven.configure(bg=c["blanco"])
+        ven.resizable(False, False)
+        ven.transient(self.root)
+        if self._logo:
+            tk.Label(ven, image=self._logo, bg=c["blanco"]).pack(pady=(22, 8))
+        tk.Label(ven, text=TITULO_APLICATIVO, bg=c["blanco"], fg=c["verde_oscuro"], font=self.f_titulo).pack()
+        tk.Label(ven, text=f"{SECRETARIA}\n{DEPENDENCIA}", bg=c["blanco"], fg=c["verde"],
+                 font=self.f_subtitulo_negrita, justify="center").pack(pady=(4, 12))
+        tk.Frame(ven, bg=c["linea"], height=1).pack(fill="x", padx=28)
+        datos = tk.Frame(ven, bg=c["blanco"])
+        datos.pack(padx=28, pady=12)
+        filas = [
+            ("Versión", f"{VERSION_APLICATIVO} (BETA)"),
+            ("Reglas de análisis", VERSION_REGLAS),
+            ("Desarrollado por", "Alexander Gómez Avendaño"),
+            ("Carpeta de trabajo", str(CARPETA_CONSULTAS.parent if CARPETA_CONSULTAS.name == "consultas"
+                                       else CARPETA_CONSULTAS)),
+            ("Histórico", str(self.historico.carpeta) if getattr(self, "historico", None) else "—"),
+            ("Chrome", "modo normal" if getattr(self.cliente, "modo", "") == "normal" else
+                       "modo de prueba" if self.cliente and self.cliente.driver else "cerrado"),
+            ("Entorno", f"Python {platform.python_version()} · Selenium {selenium.__version__} · "
+                        f"{platform.system()} {platform.release()}"),
+        ]
+        for i, (nombre, valor) in enumerate(filas):
+            tk.Label(datos, text=nombre, bg=c["blanco"], fg=c["texto_suave"], font=self.f_pequena,
+                     anchor="e").grid(row=i, column=0, sticky="e", padx=(0, 10), pady=1)
+            tk.Label(datos, text=valor, bg=c["blanco"], fg=c["texto"], font=self.f_pequena, anchor="w",
+                     wraplength=420, justify="left").grid(row=i, column=1, sticky="w", pady=1)
+        tk.Label(ven, text="Gobernación de Antioquia · uso interno", bg=c["blanco"], fg=c["texto_suave"],
+                 font=self.f_mini).pack(pady=(0, 6))
+        botones = tk.Frame(ven, bg=c["blanco"])
+        botones.pack(pady=(0, 18))
+        BotonPro(botones, "Buscar actualización", lambda: self._buscar_actualizacion(manual=True),
+                 variante="secundario", fuente=self.f_boton).pack(side="left")
+        BotonPro(botones, "Cerrar", ven.destroy, variante="primario", fuente=self.f_boton).pack(side="left")
+        ven.bind("<Escape>", lambda e: ven.destroy())
+        colorear_barra_titulo(ven)
+
     def _buscar_actualizacion(self, manual=False):
         """Consulta en segundo plano la versión publicada; el resultado llega por la cola."""
         if not manual:
@@ -2793,10 +2888,20 @@ class App:
     # --- Registro, progreso y tabla ---------------------------------------------
 
     def _log(self, mensaje):
+        linea = f"[{datetime.now():%H:%M:%S}] {mensaje}"
         self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", f"[{datetime.now():%H:%M:%S}] {mensaje}\n")
+        self.txt_log.insert("end", linea + "\n")
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
+        # Copia en archivo, para soporte: si algo falla, el registro queda aunque se cierre la ventana.
+        try:
+            ARCHIVO_REGISTRO.parent.mkdir(parents=True, exist_ok=True)
+            if ARCHIVO_REGISTRO.exists() and ARCHIVO_REGISTRO.stat().st_size > 2_000_000:
+                os.replace(ARCHIVO_REGISTRO, ARCHIVO_REGISTRO.with_suffix(".anterior.log"))
+            with open(ARCHIVO_REGISTRO, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d} {linea}\n")
+        except OSError:
+            pass
 
     def log_hilo(self, mensaje):
         self.cola.put(("log", mensaje))
@@ -3205,6 +3310,9 @@ class App:
             self.cola.put(("info", f"{e}\nLos resultados obtenidos se guardaron en el archivo parcial."))
         except NavegadorCerrado as e:
             self.log_hilo(f"Proceso interrumpido: {e}")
+        except PerfilChromeOcupado as e:
+            self.log_hilo("No se inició: hay un Chrome abierto con el perfil de VUR fuera del programa.")
+            self.cola.put(("info", str(e)))
         except Exception as e:
             self.log_hilo(f"Error general: {type(e).__name__}: {mensaje_corto(e)}")
         finally:
@@ -3531,6 +3639,8 @@ class App:
                 json.dump(datos, f, ensure_ascii=False, indent=2)
             self.log_hilo(f"Diagnóstico guardado en {ruta}")
             self.cola.put(("info", f"Diagnóstico guardado en:\n{ruta}"))
+        except PerfilChromeOcupado as e:
+            self.cola.put(("info", str(e)))
         except Exception as e:
             self.log_hilo(f"Error en diagnóstico: {type(e).__name__}: {mensaje_corto(e)}")
         finally:
@@ -4145,6 +4255,17 @@ def ejecutar_autopruebas():
                 bueno = Path(d) / "c.py"
                 bueno.write_text('VERSION_APLICATIVO = "2026.12.1-1"\n', encoding="utf-8")
                 self.assertTrue(v.validar_programa(bueno, probar=False)[0])
+
+    class PerfilOcupado(unittest.TestCase):
+        def test_detecta_lockfile_bloqueado_y_limpia_restos(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                self.assertFalse(v.perfil_en_uso(d))
+                (Path(d) / "lockfile").write_text("x")
+                self.assertFalse(v.perfil_en_uso(d))          # resto de un Chrome cerrado: se borra
+                self.assertFalse((Path(d) / "lockfile").exists())
+                (Path(d) / "SingletonLock").symlink_to("PC-123")
+                self.assertTrue(v.perfil_en_uso(d))           # Chrome abierto (Linux)
 
     casos = [c for c in list(locals().values())
              if isinstance(c, type) and issubclass(c, unittest.TestCase)]
