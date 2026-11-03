@@ -34,8 +34,15 @@ usuario propio de VUR.
 
 1. Paso 1: **Seleccionar Excel** con la columna de matrículas (por ejemplo `001-123456`).
 2. Paso 2: **Iniciar consultas**. Se abre Chrome; usted inicia sesión en VUR y resuelve el captcha.
-3. Paso 3: **Guardar Excel**. El archivo trae las hojas «Resultados» y «Resumen». Con **Comparar** se
-   ve qué cambió entre dos consultas del mismo lote.
+3. Paso 3: **Guardar Excel**. El archivo trae las hojas «Resultados», «Resumen» y, si hay matrículas
+   para revisar, «Para revisión». Esta última reúne lo necesario para revisar sin abrir VUR (resultado,
+   folio y nivel de la anotación, ente, texto de la anotación) y tiene columnas para el revisor:
+   **Veredicto** (lista Correcto / Incorrecto / Duda) y **Observación**. Con **Comparar** se ve qué
+   cambió entre dos consultas del mismo lote.
+
+**Una sola matrícula:** escríbala en **«Consultar una matrícula»** (sobre la tabla), por ejemplo
+`035-457`, y pulse Enter. Se consulta siempre en VUR (no en el histórico), con las mismas reglas, y el
+resultado se abre en una ventana con el botón **Guardar Excel**. Queda registrada en el histórico.
 
 Antes de consultar VUR, el programa revisa el **histórico**. Si una matrícula se consultó hace menos
 de 30 días con confiabilidad ALTA, toma ese resultado (columna *Fuente* = Histórico) y no gasta

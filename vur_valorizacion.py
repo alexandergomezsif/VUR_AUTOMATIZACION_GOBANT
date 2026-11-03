@@ -144,11 +144,11 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.10.30-7"
+VERSION_APLICATIVO = "2026.11.3-1"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
-VERSION_REGLAS = "2026.10.30-1"
+VERSION_REGLAS = "2026.11.3-1"
 
 # Confiabilidad de cada resultado:
 #   ALTA    -> todo lo que sustenta el estado viene explícito en VUR.
@@ -301,6 +301,14 @@ def limpiar_matricula(valor):
     return t.replace(" ", "")
 
 
+def sugerir_matricula(valor):
+    """Para una matrícula con el círculo al final ('1554984001' o '1554984-001') propone
+    '001-1554984'. Solo se sugiere: el programa nunca la corrige por su cuenta."""
+    t = limpiar_matricula(valor)
+    m = re.fullmatch(r"(\d{7})(\d{3})", t) or re.fullmatch(r"(\d{4,8})-(\d{2}[0-9N])", t)
+    return f"{m.group(2)}-{m.group(1)}" if m else ""
+
+
 def separar_matricula(matricula):
     """'01N-0005202' -> ('01N', '5202'). El servicio de VUR no acepta ceros a la izquierda."""
     m = re.fullmatch(r"([0-9A-Z]{3})-(\d+)", matricula or "")
@@ -314,7 +322,9 @@ def html_a_texto(valor):
     return "\n".join(re.sub(r"[ \t]+", " ", l).strip() for l in t.split("\n") if l.strip())
 
 
-RE_ANOTACION = re.compile(r"ANOTACION:\s*Nro\s*(\d+)\s*Fecha:\s*([\d/-]+)", re.IGNORECASE)
+# VUR puede intercalar un aviso entre "ANOTACION:" y "Nro", p. ej.
+# "ANOTACION: *** ESTA ANOTACION NO TIENE VALIDEZ *** Nro 4 Fecha: ..." (018-16830, revisión del 03/11/2026).
+RE_ANOTACION = re.compile(r"ANOTACION:\s*(?:\*{3}[^*\n]*\*{3}\s*)?Nro\s*(\d+)\s*Fecha:\s*([\d/-]+)", re.IGNORECASE)
 RE_CANCELA = re.compile(r"Se cancela anotaci\S*n No:\s*([\d,\s]+)", re.IGNORECASE)
 
 
@@ -338,6 +348,7 @@ def parsear_anotacion(valor_html):
         "fecha": m.group(2) if m else "",
         "especificacion": especificacion,
         "sin_especificacion": not espec,
+        "sin_validez": "NO TIENE VALIDEZ" in normalizar(texto),   # anulada en el registro: no cuenta
         "naturaleza": naturaleza.group(1).strip() if naturaleza else "",
         "cancela": cancela,
         "de": [l[3:].strip() for l in lineas if l.startswith("DE:")],
@@ -387,6 +398,11 @@ def tipo_valorizacion(anotacion):
         return "afectacion"
     if _codigo(anotacion["especificacion"]) in CODIGOS_GRAVAMEN_VALORIZACION:
         return "gravamen"
+    # 999 = "OTRO": código genérico de VUR para actos de la tabla antigua, p. ej.
+    # "999 GRAVAMEN DE VALORIZACION (430) (OTRO)" (001-77175). Si el texto dice que es un
+    # gravamen, es un gravamen normal (revisión del funcionario del 03/11/2026).
+    if _codigo(anotacion["especificacion"]) == "999" and "GRAVAMEN" in normalizar(anotacion["especificacion"]):
+        return "gravamen"
     return "dudosa"
 
 
@@ -418,6 +434,9 @@ def analizar_folio(anotaciones):
     que citen la misma obra o resolución; si no comparten referencia, a todas
     las vigentes anteriores de ese tipo. El vínculo queda marcado 'texto'.
     """
+    # Una anotación que VUR marca "NO TIENE VALIDEZ" no grava ni cancela; si menciona
+    # valorización, describir_no_reconocidas pide revisarla.
+    anotaciones = [a for a in anotaciones if not a.get("sin_validez")]
     valorizacion = [dict(a, cancelada_por=None, vinculo="") for a in anotaciones if es_valorizacion(a)]
     afectaciones = [dict(a, cancelada_por=None, vinculo="") for a in anotaciones
                     if tipo_valorizacion(a) == "afectacion"]
@@ -534,6 +553,15 @@ def describir_no_reconocidas(etiqueta, anotaciones):
     for i, a in enumerate(anotaciones, 1):
         if not a["texto"].strip():
             continue
+        if a.get("sin_validez"):
+            nombre = f"anotación {a['nro']}" if a["nro"] is not None else f"entrada {i}"
+            if any(normalizar(p) in normalizar(a["texto"]) for p in PALABRAS_VALORIZACION):
+                motivos.append(f"{etiqueta}: {nombre} marcada «NO TIENE VALIDEZ» y MENCIONA VALORIZACIÓN: "
+                               "no se tuvo en cuenta; revisarla en VUR")
+                notas.append(f"Texto de la {nombre} de {etiqueta}: «{a['texto'][:300]}»")
+            else:
+                notas.append(f"{etiqueta}: la {nombre} dice «NO TIENE VALIDEZ»; no se tuvo en cuenta")
+            continue
         if a["nro"] is None:
             falla = f"entrada {i} sin número de anotación"
         elif not a["especificacion"]:
@@ -558,7 +586,7 @@ def propietarios_en_fecha(anotaciones, nro_limite=None):
     """Personas 'A:' de la última anotación de adquisición (compraventa, adjudicación...)
     anterior a la anotación nro_limite (o la última del folio si no se indica).
     Devuelve (personas, nro_anotacion) o ([], None)."""
-    candidatas = [a for a in anotaciones if es_adquisicion(a) and a["a"]
+    candidatas = [a for a in anotaciones if es_adquisicion(a) and a["a"] and not a.get("sin_validez")
                   and (nro_limite is None or (a["nro"] or 0) < nro_limite)]
     if not candidatas:
         return [], None
@@ -571,7 +599,7 @@ def propietarios_hasta_fecha(anotaciones, fecha):
     candidatas = []
     for a in anotaciones:
         f = parsear_fecha(a["fecha"])
-        if es_adquisicion(a) and a["a"] and f and f <= fecha:
+        if es_adquisicion(a) and a["a"] and not a.get("sin_validez") and f and f <= fecha:
             candidatas.append((f, a["nro"] or 0, a))
     if not candidatas:
         return [], None
@@ -1856,6 +1884,7 @@ def exportar_excel(registros, ruta, duracion=""):
         elif celda.value == CONFIABILIDAD_ALTA:
             celda.font = Font(bold=True, color=COLOR["verde"][1:])
     _hoja_resumen(wb, registros, duracion)
+    _hoja_revision(wb, registros)
     wb.save(ruta)
 
 
@@ -1906,6 +1935,59 @@ def _hoja_resumen(wb, registros, duracion=""):
                 celda.data_type = "s"
     for col, ancho in zip("ABCD", (34, 22, 30, 90)):
         ws.column_dimensions[col].width = ancho
+
+
+COLUMNAS_REVISION = [  # (columna de resultados o None, encabezado, ancho)
+    ("Matricula_Limpia", "Matrícula", 14), ("Municipio", "Municipio", 16), ("Resultado", "Resultado", 40),
+    ("Motivos_Revision", "Por qué revisar", 45), ("Ente_Valorizacion", "Ente", 14),
+    ("Matricula_Con_Anotacion", "Folio con la anotación", 14), ("Nivel_Matriz", "Nivel de matriz", 8),
+    ("Matricula_Cancelacion", "Folio de la cancelación", 14),
+    ("Detalle_Valorizacion", "Anotación de valorización", 60),
+    ("Valorizacion_Otros_Entes", "Valorización de otros entes (informativa)", 45),
+    ("Propietario_Gravado", "Propietario gravado", 35),
+    (None, "Veredicto del revisor", 14), (None, "Observación del revisor", 45),
+    (None, "Revisado por", 18), (None, "Fecha de revisión", 12),
+]
+VEREDICTOS = ("Correcto", "Incorrecto", "Duda")
+
+
+def _hoja_revision(wb, registros):
+    """Hoja 'Para revisión': lo que el profesional necesita para revisar sin abrir VUR, y
+    columnas para su veredicto (lista Correcto / Incorrecto / Duda) y su observación."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    revisar = [r for r in registros if r.get("Confiabilidad") == CONFIABILIDAD_REVISAR]
+    if not revisar:
+        return
+    ws = wb.create_sheet("Para revisión")
+    ws.append([titulo for _, titulo, _ in COLUMNAS_REVISION])
+    fondo = PatternFill("solid", fgColor=COLOR["verde_oscuro"][1:])
+    fondo_revisor = PatternFill("solid", fgColor="A3570A")
+    for celda, (campo, _, _) in zip(ws[1], COLUMNAS_REVISION):
+        celda.fill = fondo if campo else fondo_revisor
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.alignment = Alignment(wrap_text=True, vertical="center")
+    for r in revisar:
+        r = dict(r, Resultado=conclusion(r))
+        ws.append([str(r.get(campo, "") or "") if campo else "" for campo, _, _ in COLUMNAS_REVISION])
+    for i, (campo, _, ancho) in enumerate(COLUMNAS_REVISION, 1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+        for (celda,) in ws.iter_rows(min_row=2, min_col=i, max_col=i):
+            if isinstance(celda.value, str) and celda.value.startswith("="):
+                celda.data_type = "s"
+            celda.alignment = Alignment(wrap_text=campo not in TEXTOS_LARGOS, vertical="top")
+            if not campo:
+                celda.fill = PatternFill("solid", fgColor="FDF3E6")
+    col = get_column_letter([t for _, t, _ in COLUMNAS_REVISION].index("Veredicto del revisor") + 1)
+    lista = DataValidation(type="list", formula1='"' + ",".join(VEREDICTOS) + '"', allow_blank=True,
+                           showErrorMessage=True, errorTitle="Veredicto",
+                           error="Elija Correcto, Incorrecto o Duda.")
+    lista.add(f"{col}2:{col}{ws.max_row}")
+    ws.add_data_validation(lista)
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = ws.dimensions
 
 
 # ---------------------------------------------------------------------------
@@ -2913,10 +2995,6 @@ class App:
         self.btn_detener = self._boton(g2, "Detener", self.solicitar_detener, "peligro", state="disabled",
                                        ayuda="Se detiene al terminar la matrícula actual y guarda el parcial.")
         self.btn_detener.pack(side="left")
-        self.btn_diagnostico = self._boton(
-            g2, "Diagnosticar", self.diagnosticar,
-            ayuda="Descarga la respuesta completa de VUR de una matrícula a un archivo JSON, para soporte técnico.")
-        self.btn_diagnostico.pack(side="left")
         self._divisor(fila, 3)
 
         g3 = self._paso(fila, 4, 3)
@@ -2983,8 +3061,30 @@ class App:
         self.segmentos = Segmentado(cab_r, ["Resultados", "Registro del proceso"], self._mostrar_vista,
                                     c["blanco"], self.f_texto, self.f_subtitulo_negrita)
         self.segmentos.pack(side="left")
-        tk.Label(cab_r, text="Doble clic o Enter sobre una fila para ver el detalle completo",
-                 bg=c["blanco"], fg=c["texto_suave"], font=self.f_pequena).pack(side="right")
+        # Consulta de UNA matrícula escrita a mano (sin cargar Excel).
+        g4 = tk.Frame(cab_r, bg=c["blanco"])
+        g4.pack(side="right")
+        tk.Label(g4, text="Consultar una matrícula", bg=c["blanco"], fg=c["verde_oscuro"],
+                 font=self.f_pequena_negrita).pack(side="left", padx=(0, 8))
+        marco_entrada = tk.Frame(g4, bg=c["linea"], padx=1, pady=1)
+        marco_entrada.pack(side="left", padx=(0, 6))
+        self.txt_una = tk.Entry(marco_entrada, width=13, font=self.f_texto, relief="flat", bd=4,
+                                bg=c["blanco"], fg=c["texto"], insertbackground=c["texto"])
+        self.txt_una.pack()
+        self._marcador_una = "035-457"
+        self._poner_marcador_una()
+        self.txt_una.bind("<FocusIn>", self._quitar_marcador_una)
+        self.txt_una.bind("<FocusOut>", lambda e: self._poner_marcador_una())
+        self.txt_una.bind("<Return>", lambda e: self.consultar_una())
+        Ayuda(self.txt_una, "Escriba una matrícula (círculo-número, por ejemplo 035-457) y pulse Enter o "
+                            "«Consultar una». No hace falta cargar un Excel.", self.f_pequena)
+        self.btn_una = self._boton(
+            g4, "Consultar", self.consultar_una,
+            ayuda="Consulta en VUR solo la matrícula escrita (siempre en VUR, no en el histórico) y muestra el "
+                  "resultado en una ventana, desde donde se puede guardar en Excel.")
+        self.btn_una.pack(side="left")
+        tk.Label(cab_r, text="Doble clic en una fila: detalle", bg=c["blanco"], fg=c["texto_suave"],
+                 font=self.f_pequena).pack(side="right", padx=(0, 18))
         tk.Frame(r, bg=c["linea"], height=1).grid(row=1, column=0, sticky="ew")
 
         self.vista_tabla = tk.Frame(r, bg=c["blanco"])
@@ -3009,7 +3109,8 @@ class App:
         self.tabla.bind("<<TreeviewSelect>>", self._marcar_seleccion)
         self.lbl_vacio = tk.Label(self.vista_tabla, bg=c["blanco"], fg=c["texto_suave"], font=self.f_texto,
                                   justify="center", text="Aún no hay resultados.\n"
-                                  "Seleccione el Excel de matrículas (paso 1) y pulse «Iniciar consultas» (paso 2).")
+                                  "Seleccione el Excel de matrículas (paso 1) y pulse «Iniciar consultas» (paso 2).\n"
+                                  "Para una sola matrícula, escríbala arriba a la derecha en «Consultar una matrícula».")
         self.lbl_vacio.place(relx=0.5, rely=0.45, anchor="center")
 
         self.vista_log = tk.Frame(r, bg=c["blanco"])
@@ -3038,6 +3139,7 @@ class App:
         ayuda.add_command(label="Buscar actualización", command=lambda: self._buscar_actualizacion(manual=True))
         ayuda.add_command(label="Instalar conector de Chrome (VUR en una pestaña)", command=self._instalar_conector)
         ayuda.add_command(label="Abrir registro del proceso (archivo)", command=self._abrir_registro)
+        ayuda.add_command(label="Diagnosticar una matrícula (soporte técnico)", command=self.diagnosticar)
         ayuda.add_separator()
         ayuda.add_command(label="Acerca de", accelerator="F1", command=self._acerca_de)
         barra.add_cascade(label="Ayuda", menu=ayuda)
@@ -3270,8 +3372,9 @@ class App:
 
     def _en_ejecucion(self, activo):
         estado = "disabled" if activo else "normal"
-        for b in (self.btn_seleccionar, self.btn_iniciar, self.btn_diagnostico, self.btn_guardar, self.btn_comparar):
+        for b in (self.btn_seleccionar, self.btn_iniciar, self.btn_guardar, self.btn_comparar, self.btn_una):
             b.configure(state=estado)
+        self.txt_una.configure(state=estado)
         self.chk_forzar.configure(state=estado)
         self.btn_detener.configure(state="normal" if activo else "disabled")
 
@@ -3338,6 +3441,10 @@ class App:
             if indice >= len(self.resultados):
                 return
             reg = dict(self.resultados[indice])
+        self._ventana_detalle(reg)
+
+    def _ventana_detalle(self, reg, para_guardar=False):
+        """Ventana con el detalle de un resultado. para_guardar: consulta individual (botón Guardar Excel)."""
         c = COLOR
         ven = tk.Toplevel(self.root)
         ven.title(f"Detalle {reg.get('Matricula_Limpia', '')}")
@@ -3357,7 +3464,16 @@ class App:
         tk.Label(linea, text=f"Confiabilidad: {confiab or '—'}", bg=c["blanco"],
                  fg="#A3570A" if confiab == CONFIABILIDAD_REVISAR else c["texto_suave"],
                  font=self.f_pequena_negrita).pack(side="left", padx=(12, 0))
+        tk.Label(cab, text=conclusion(reg), bg=c["blanco"], fg=color, font=self.f_subtitulo_negrita,
+                 justify="left", wraplength=800).pack(anchor="w", pady=(8, 0))
         tk.Frame(ven, bg=c["verde"], height=2).pack(fill="x")
+        if para_guardar:
+            pie = tk.Frame(ven, bg=c["blanco"])
+            pie.pack(side="bottom", fill="x", padx=24, pady=10)
+            self._boton(pie, "Guardar Excel", lambda: self._guardar_una(reg, ven), "primario",
+                        ayuda="Guarda este resultado en un Excel con el formato institucional.").pack(side="right")
+            self._boton(pie, "Cerrar", ven.destroy).pack(side="right", padx=(0, 8))
+            tk.Frame(ven, bg=c["linea"], height=1).pack(side="bottom", fill="x")
         marco = tk.Frame(ven, bg=c["blanco"])
         marco.pack(fill="both", expand=True)
         txt = tk.Text(marco, wrap="word", font=self.f_texto, relief="flat", bd=0, padx=24, pady=10,
@@ -3386,6 +3502,112 @@ class App:
             txt.insert("end", valor + "\n")
         txt.configure(state="disabled")
         colorear_barra_titulo(ven)
+
+    # --- Consulta de una sola matrícula ----------------------------------------
+
+    def _poner_marcador_una(self):
+        if not self.txt_una.get():
+            self.txt_una.insert(0, self._marcador_una)
+            self.txt_una.configure(fg=COLOR["texto_suave"])
+
+    def _quitar_marcador_una(self, _evento=None):
+        if self.txt_una.cget("fg") == COLOR["texto_suave"]:
+            self.txt_una.delete(0, "end")
+            self.txt_una.configure(fg=COLOR["texto"])
+
+    def consultar_una(self):
+        if self.hilo and self.hilo.is_alive():
+            return
+        texto = "" if self.txt_una.cget("fg") == COLOR["texto_suave"] else self.txt_una.get().strip()
+        if not texto:
+            messagebox.showinfo("Consultar una matrícula", "Escriba la matrícula (por ejemplo 035-457).",
+                                parent=self.root)
+            self.txt_una.focus_set()
+            return
+        limpia = limpiar_matricula(texto)
+        if not separar_matricula(limpia):
+            sugerida = sugerir_matricula(texto)
+            if not (sugerida and messagebox.askyesno(
+                    "Consultar una matrícula", f"«{texto}» no tiene el formato círculo-número.\n\n"
+                    f"¿Quiso decir {sugerida}?", parent=self.root)):
+                if not sugerida:
+                    messagebox.showwarning("Consultar una matrícula", f"Formato de matrícula inválido: {texto}\n\n"
+                                           "Escríbala como círculo-número, por ejemplo 035-457 o 01N-5202.",
+                                           parent=self.root)
+                return
+            limpia = sugerida
+            self.txt_una.delete(0, "end")
+            self.txt_una.insert(0, limpia)
+        fila = pd.Series({"Matricula_Original": texto, "Matricula_Limpia": limpia})
+        self.detener.clear()
+        self._en_ejecucion(True)
+        self._log(f"Consulta individual: {limpia}")
+        self.hilo = threading.Thread(target=self._flujo_una, args=(fila,), daemon=True)
+        self.hilo.start()
+
+    def _flujo_una(self, fila):
+        """Consulta una matrícula en VUR con las mismas reglas del proceso por lotes y la guarda en el histórico."""
+        import time
+        cliente, sesion_vur = self._obtener_cliente()
+        try:
+            if sesion_vur and not cliente.sesion_vigente():
+                self.log_hilo("La sesión de VUR abierta ya no está activa: hay que ingresar de nuevo.")
+                sesion_vur = False
+            if not sesion_vur:
+                if not self._iniciar_sesion(cliente):
+                    self.log_hilo("Consulta cancelada por el usuario.")
+                    return
+                cliente.renovada = datetime.now()
+            else:
+                cliente.notificar("activa")
+            try:
+                self.historico.cargar()
+            except Exception as e:  # noqa: BLE001
+                self.log_hilo(f"Histórico no disponible: {type(e).__name__}: {e}")
+            self._previo = dict(self.historico.ultimo)  # para avisar si cambió respecto a una consulta anterior
+            registro = self._consultar_y_registrar(cliente, fila)
+            if necesita_segunda_pasada(registro) and not self.detener.is_set():
+                self.log_hilo(f"{fila['Matricula_Limpia']}: respuesta incompleta de VUR; se repite en 10 s.")
+                time.sleep(10)
+                registro = self._consultar_y_registrar(cliente, fila, registro)
+            self.log_hilo(f"Consulta individual {fila['Matricula_Limpia']}: {registro.get('Estado')} "
+                          f"({cliente.consultas} peticiones a VUR)")
+            self.cola.put(("una", registro))
+        except ProcesoDetenido:
+            self.log_hilo("Consulta individual detenida.")
+        except LimiteDiario as e:
+            self.log_hilo(f"Consulta detenida: {e}")
+            self.cola.put(("info", str(e)))
+        except NavegadorCerrado as e:
+            self.log_hilo(f"Consulta interrumpida: {e}")
+        except PerfilChromeOcupado as e:
+            self.cola.put(("info", str(e)))
+        except Exception as e:  # noqa: BLE001
+            self.log_hilo(f"Error en la consulta individual: {type(e).__name__}: {mensaje_corto(e)}")
+        finally:
+            if not cliente.vivo():
+                cliente.cerrar_navegador()
+            try:
+                self.historico.exportar_excel()
+            except Exception:  # noqa: BLE001 - el Excel del histórico es solo para leer
+                pass
+            self.cola.put(("fin", None))
+
+    def _guardar_una(self, reg, ventana):
+        sugerido = f"consulta_{reg.get('Matricula_Limpia', 'matricula')}_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        ruta = filedialog.asksaveasfilename(parent=ventana, title="Guardar consulta", defaultextension=".xlsx",
+                                            initialdir=str(CARPETA_CONSULTAS), initialfile=sugerido,
+                                            filetypes=[("Excel", "*.xlsx")])
+        if not ruta:
+            return
+        try:
+            exportar_excel([reg], Path(ruta))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Guardar consulta", f"No se pudo guardar (¿está abierto en Excel?):\n{e}",
+                                 parent=ventana)
+            return
+        self._log(f"Consulta individual guardada: {ruta}")
+        messagebox.showinfo("Guardar consulta", f"Guardado en:\n{ruta}", parent=ventana)
 
     def _procesar_cola(self):
         try:
@@ -3418,6 +3640,8 @@ class App:
                     evento.set()
                 elif tipo == "info":
                     messagebox.showinfo("VUR", dato, parent=self.root)
+                elif tipo == "una":
+                    self._ventana_detalle(dato, para_guardar=True)
                 elif tipo == "fin":
                     self._en_ejecucion(False)
                     if self._inicio_proceso and not self._fin_proceso:
@@ -3501,9 +3725,9 @@ class App:
         self.hilo.start()
 
     def diagnosticar(self):
-        if not self._validar_carga():
+        if self.hilo and self.hilo.is_alive():
             return
-        sugerida = next((m for m in self.df["Matricula_Limpia"] if separar_matricula(m)), "")
+        sugerida = "" if self.df is None else next((m for m in self.df["Matricula_Limpia"] if separar_matricula(m)), "")
         texto = simpledialog.askstring("Diagnóstico VUR", "Matrícula a diagnosticar:",
                                        initialvalue=sugerida, parent=self.root)
         if not texto:
@@ -3772,8 +3996,11 @@ class App:
 
         partes = separar_matricula(limpia)
         if not partes:
-            registro.update(Estado="ERROR", Notas_Proceso="Formato de matrícula inválido",
-                            Motivos_Revision="Formato de matrícula inválido",
+            sugerida = sugerir_matricula(original)
+            pista = f"; ¿quiso decir {sugerida}? (el círculo parece estar al final): corrija el Excel" \
+                if sugerida else ""
+            registro.update(Estado="ERROR", Notas_Proceso="Formato de matrícula inválido" + pista,
+                            Motivos_Revision="Formato de matrícula inválido" + pista,
                             Fecha_Consulta=f"{datetime.now():%Y-%m-%d %H:%M:%S}")
             self.log_hilo(f"{original}: formato inválido, se omite.")
             return registro
@@ -3885,7 +4112,10 @@ class App:
                     cliente, r["matricula"], r.get("datos_folio"), a["fecha"])
                 if personas:
                     gravados.extend(f"{limpiar_persona(p)} (propietario según anotación {nro_adq})" for p in personas)
-                    motivos.append("Propietario gravado deducido de la adquisición anterior (VUR no lo indica)")
+                    # Confirmado por el funcionario (25 de 25 casos correctos, 03/11/2026): queda como
+                    # nota. La deducción desde la matriz y el propietario no identificado sí se revisan.
+                    notas.append(f"Anotación {a['nro']} de {r['matricula']}: VUR no indica el propietario; se tomó "
+                                 f"el de la adquisición anterior (anotación {nro_adq})")
                 elif desde_matriz:
                     gravados.extend(desde_matriz)
                     motivos.append("Propietario gravado deducido de la matriz del folio (VUR no lo indica y el "
@@ -3917,7 +4147,7 @@ class App:
                     f" (según anotación {nro_adq} del estado jurídico; datos básicos no trae propietarios)"
                 registro["Propietario"] = limpiar_persona(personas[0])
                 registro["Total_Propietarios"] = len(personas)
-                motivos.append("Propietarios actuales tomados del estado jurídico (datos básicos no los trae)")
+                notas.append("Propietarios actuales tomados del estado jurídico (datos básicos no los trae)")
         if r["estado"] == "NO GRAVADA":
             notas.append("NO ESTÁ GRAVADA EN VUR")
         elif r["estado"] == ESTADO_INCOMPLETO:
@@ -3995,7 +4225,8 @@ class App:
             if not sesion_vur and not self._iniciar_sesion(cliente):
                 return
             etiqueta = f"{partes[0]}-{partes[1]}"
-            ruta = self.ruta_excel.with_name(f"diagnostico_{etiqueta}.json")
+            carpeta = self.ruta_excel.parent if self.ruta_excel else CARPETA_CONSULTAS
+            ruta = carpeta / f"diagnostico_{etiqueta}.json"
             datos = {"datosBasicos": cliente.datos_basicos(*partes),
                      "estadoJuridico": cliente.estado_juridico(*partes)}
             with open(ruta, "w", encoding="utf-8") as f:
@@ -4294,12 +4525,81 @@ def ejecutar_autopruebas():
                 ruta = Path(d) / "r.xlsx"
                 v.exportar_excel(regs, ruta)
                 wb = openpyxl.load_workbook(ruta)
-                self.assertEqual(wb.sheetnames, ["Resultados", "Resumen"])
+                self.assertEqual(wb.sheetnames, ["Resultados", "Resumen", "Para revisión"])
                 self.assertEqual(wb.active.title, "Resumen")
                 valores = [c for fila in wb["Resumen"].iter_rows(values_only=True) for c in fila if c is not None]
                 self.assertIn("Requieren revisión del profesional", valores)
                 self.assertIn("=prueba", valores)  # texto, no fórmula
 
+
+    class RevisionFuncionario031126(unittest.TestCase):
+        """Ajustes tras la revisión del funcionario de la lista del 29/10/2026."""
+
+        def test_anotacion_sin_validez_se_lee_y_no_cuenta(self):
+            invalida = an(4, "14-06-1983", "210 HIPOTECA (GRAVAMEN)", ["DE: TITULAR FICTICIO", "A: BANCO FICTICIO"]) \
+                .replace("ANOTACION: Nro", "ANOTACION: *** ESTA ANOTACION NO TIENE VALIDEZ *** Nro")
+            a = v.parsear_anotacion(invalida)
+            self.assertEqual((a["nro"], a["sin_validez"]), (4, True))
+            motivos, notas = v.describir_no_reconocidas("018-1", [v.parsear_anotacion(COMPRA), a])
+            self.assertEqual(motivos, [])
+            self.assertIn("NO TIENE VALIDEZ", notas[0])
+
+        def test_valorizacion_sin_validez_no_grava_pero_se_revisa(self):
+            invalida = VAL_430.replace("ANOTACION: Nro", "ANOTACION: *** ESTA ANOTACION NO TIENE VALIDEZ *** Nro")
+            self.assertEqual(folio([COMPRA, invalida])["estado"], "NO GRAVADA")
+            motivos, _ = v.describir_no_reconocidas("008-1", [v.parsear_anotacion(invalida)])
+            self.assertIn("MENCIONA VALORIZACIÓN", motivos[0])
+
+        def test_cancelacion_sin_validez_no_cancela(self):
+            invalida = CAN_5.replace("ANOTACION: Nro", "ANOTACION: *** ESTA ANOTACION NO TIENE VALIDEZ *** Nro")
+            self.assertEqual(folio([COMPRA, VAL_430, invalida])["estado"], "GRAVADA")
+
+        def test_codigo_999_gravamen_es_valorizacion_normal(self):
+            val = an(8, "12-06-1991", "999 GRAVAMEN DE VALORIZACION (430) (OTRO)",
+                     ["DE: DEPARTAMENTO DE ANTIOQUIA DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION"])
+            self.assertEqual(v.tipo_valorizacion(v.parsear_anotacion(val)), "gravamen")
+            otra = an(8, "12-06-1991", "999 VALORIZACION OBRA (OTRO)", ["DE: DEPARTAMENTO DE ANTIOQUIA"])
+            self.assertEqual(v.tipo_valorizacion(v.parsear_anotacion(otra)), "dudosa")   # sin "GRAVAMEN": se revisa
+
+        def test_propietario_de_la_adquisicion_anterior_no_pide_revision(self):
+            sin_a = an(5, "13-05-1999", "430 GRAVAMEN POR CONTRIBUCION DE VALORIZACION (GRAVAMEN)",
+                       ["DE: DEPARTAMENTO DE ANTIOQUIA"])
+            r = consultar({"008-1": db_basico("NECHI")}, {"008-1": {"textoAnotaciones": [COMPRA, sin_a]}}, "008", "1")
+            self.assertEqual((r["Estado"], r["Confiabilidad"]), ("GRAVADA", "ALTA"))
+            self.assertIn("(propietario según anotación 1)", r["Propietario_Gravado"])
+            self.assertIn("se tomó el de la adquisición anterior (anotación 1)", r["Notas_Proceso"])
+
+        def test_propietarios_del_estado_juridico_no_piden_revision(self):
+            r = consultar({"008-1": db_basico("NECHI", propietarios=False)},
+                          {"008-1": {"textoAnotaciones": [COMPRA]}}, "008", "1")
+            self.assertEqual((r["Estado"], r["Confiabilidad"]), ("NO GRAVADA", "ALTA"))
+            self.assertIn("Propietarios actuales tomados del estado jurídico", r["Notas_Proceso"])
+
+        def test_sugerencia_de_matricula_con_circulo_al_final(self):
+            self.assertEqual(v.sugerir_matricula("1554984001"), "001-1554984")
+            self.assertEqual(v.sugerir_matricula("0093586020"), "020-0093586")
+            self.assertEqual(v.sugerir_matricula("1554984-01N"), "01N-1554984")
+            self.assertEqual(v.sugerir_matricula("035-457"), "")
+            self.assertEqual(v.sugerir_matricula("12345"), "")
+
+        def test_hoja_para_revision_con_veredicto(self):
+            import tempfile
+            import openpyxl
+            regs = [dict(Matricula_Limpia="020-1", Estado="GRAVAMEN CANCELADO", Confiabilidad="REVISAR",
+                         Motivos_Revision="x", Matricula_Con_Anotacion="020-9", Nivel_Matriz="2"),
+                    dict(Matricula_Limpia="020-2", Estado="NO GRAVADA", Confiabilidad="ALTA")]
+            with tempfile.TemporaryDirectory() as d:
+                ruta = Path(d) / "r.xlsx"
+                v.exportar_excel(regs, ruta)
+                ws = openpyxl.load_workbook(ruta)["Para revisión"]
+                encabezado = [c.value for c in ws[1]]
+                self.assertEqual(ws.max_row, 2)                       # solo las que requieren revisión
+                fila = dict(zip(encabezado, [c.value for c in ws[2]]))
+                self.assertEqual((fila["Matrícula"], fila["Folio con la anotación"], fila["Nivel de matriz"]),
+                                 ("020-1", "020-9", "2"))
+                self.assertIn("TUVO VALORIZACIÓN", fila["Resultado"])
+                validacion = ws.data_validations.dataValidation[0]
+                self.assertIn("Correcto,Incorrecto,Duda", validacion.formula1)
 
     class Comparacion(unittest.TestCase):
         def _excel(self, d, nombre, regs):
