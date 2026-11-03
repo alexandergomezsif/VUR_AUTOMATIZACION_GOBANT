@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.3-2"
+VERSION_APLICATIVO = "2026.11.3-3"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -3316,7 +3316,8 @@ class App:
                             parent=self.root)
         import subprocess
         import sys
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(CARPETA_RAIZ))
+        python = python_sin_consola(sys.executable) or sys.executable   # el reinicio, sin ventana negra
+        subprocess.Popen([str(python), str(Path(__file__).resolve())], cwd=str(CARPETA_RAIZ))
         self._al_cerrar()
 
     def _notificar_sesion(self, estado):
@@ -4636,6 +4637,16 @@ def ejecutar_autopruebas():
                 self.assertIn("TUVO VALORIZACIÓN", fila["Resultado"])
                 validacion = ws.data_validations.dataValidation[0]
                 self.assertIn("Correcto,Incorrecto,Duda", validacion.formula1)
+
+    class SinConsola(unittest.TestCase):
+        def test_busca_pythonw_junto_a_python(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "python.exe").write_text("")
+                self.assertIsNone(v.python_sin_consola(Path(d) / "python.exe"))      # sin pythonw: no se cambia
+                (Path(d) / "pythonw.exe").write_text("")
+                self.assertEqual(v.python_sin_consola(Path(d) / "python.exe"), Path(d) / "pythonw.exe")
+                self.assertIsNone(v.python_sin_consola(Path(d) / "pythonw.exe"))     # ya es pythonw
 
     class TipoPredio(unittest.TestCase):
         def test_zona_desde_la_referencia_catastral(self):
@@ -7571,6 +7582,41 @@ def registrar_error_inicio():
         pass
 
 
+def python_sin_consola(ejecutable):
+    """pythonw.exe junto al python.exe indicado (Windows), o None si no existe."""
+    ruta = Path(ejecutable)
+    if ruta.name.lower() != "python.exe":
+        return None
+    pyw = ruta.with_name("pythonw.exe")
+    return pyw if pyw.exists() else None
+
+
+def reabrir_sin_consola(sys):
+    """Si el programa se abrió con python.exe (doble clic sobre el .py o un acceso directo viejo),
+    Windows le pone una ventana negra de "Símbolo del sistema" y, al cerrarla, se cierra el programa.
+    En ese caso se abre de nuevo con pythonw.exe (sin esa ventana) y esta copia termina.
+    Para ver la consola a propósito (soporte): variable de entorno VUR_CON_CONSOLA=1."""
+    if os.name != "nt" or os.environ.get("VUR_CON_CONSOLA"):
+        return False
+    try:
+        import ctypes
+        if not ctypes.windll.kernel32.GetConsoleWindow():
+            return False          # ya está sin consola (pythonw)
+    except (AttributeError, OSError):
+        return False
+    pyw = python_sin_consola(sys.executable)
+    if not pyw:
+        return False              # sin pythonw.exe: se sigue con la consola antes que no abrir
+    import subprocess
+    try:
+        subprocess.Popen([str(pyw), str(Path(__file__).resolve()), *sys.argv[1:]], cwd=str(CARPETA_RAIZ),
+                         creationflags=0x00000008 | 0x00000200,   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                         close_fds=True)
+    except OSError:
+        return False
+    return True
+
+
 def principal():
     import sys
     try:
@@ -7587,6 +7633,8 @@ def _principal(sys):
         sys.exit(0 if ejecutar_autopruebas() else 1)
     if "--recursos" in sys.argv:
         print(preparar_recursos() or "No se pudieron crear los recursos")
+        return
+    if reabrir_sin_consola(sys):
         return
     preparar_recursos()
     cargar_fuentes_privadas()
