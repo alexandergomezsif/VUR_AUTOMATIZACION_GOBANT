@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.3-3"
+VERSION_APLICATIVO = "2026.11.3-4"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -2783,12 +2783,14 @@ AVISO_INACTIVIDAD_MIN = 10  # VUR cierra la sesión por inactividad; se avisa an
 # funcionario tiene un proceso en curso; con el programa quieto no se renueva nada.
 RENOVAR_SESION_MIN = 8
 ESTADOS_SESION = {
-    "cerrada": ("#9AA8A1", "Sin sesión", "Chrome está cerrado. Se abrirá al iniciar consultas."),
+    "cerrada": ("#9AA8A1", "Sin sesión", "VUR no está abierto en el programa. Se abrirá al consultar."),
     "esperando": ("#E0A100", "Esperando ingreso", "Inicie sesión y resuelva el captcha en Chrome."),
     "activa": ("#018D38", "Sesión activa", "VUR está respondiendo."),
     "inactiva": ("#E0A100", "Sesión inactiva", "Sin actividad reciente: VUR puede pedir ingresar de nuevo."),
     "vencida": ("#B3261E", "Sesión vencida", "VUR cerró la sesión: ingrese de nuevo en Chrome."),
     "limite": ("#B3261E", "Cupo agotado", "VUR no acepta más consultas de este usuario hoy."),
+    "pestana": ("#3561AB", "VUR abierto en su Chrome",
+                "Se usará esa pestaña al consultar (se verifica la sesión sin gastar cupo)."),
 }
 
 
@@ -3173,6 +3175,14 @@ class App:
     def _revisar_conector(self):
         """Cada 3 s: registra la primera vez que la extensión se reporta y avisa si está desactualizada."""
         try:
+            ocupado = bool(self.hilo and self.hilo.is_alive())
+            en_uso = self.cliente is not None and self.cliente.driver is not None
+            if not ocupado and not en_uso:
+                if CONECTOR.conectado():
+                    if self.semaforo.estado in ("cerrada", "pestana"):
+                        self.semaforo.fijar("pestana")
+                elif self.semaforo.estado == "pestana":
+                    self.semaforo.fijar("cerrada")
             if CONECTOR.conectado():
                 if not conector_conocido():
                     marcar_conector_visto(CONECTOR.version_extension)
@@ -3206,7 +3216,8 @@ class App:
             "2. Active «Modo de desarrollador» (arriba a la derecha).\n"
             "3. Pulse «Cargar extensión sin empaquetar» y elija esta carpeta (ya quedó copiada; puede "
             f"pegarla con Ctrl+V en la barra de la ventana):\n{carpeta}\n"
-            "4. Abra VUR en una pestaña de su Chrome. El programa lo detectará solo.\n\n"
+            "4. Abra VUR en una pestaña de su Chrome (si ya estaba abierto, recargue la pestaña con F5). "
+            "El programa lo detectará solo: el indicador de arriba dirá «VUR abierto en su Chrome».\n\n"
             "La extensión solo se comunica con este equipo (127.0.0.1) y solo trabaja en páginas de VUR.",
             parent=self.root)
         exe = ruta_chrome()
@@ -3367,9 +3378,38 @@ class App:
         """Reutiliza el Chrome abierto (y su sesión) o prepara uno nuevo."""
         if self.cliente and self.cliente.vivo():
             self.cliente.nueva_ejecucion()
-            return self.cliente, self.semaforo.estado in ("activa", "inactiva")
+            return self.cliente, self.semaforo.estado in ("activa", "inactiva", "pestana")
         self.cliente = VURClient(self.log_hilo, self._notificar_sesion)
+        if CONECTOR.conectado():
+            # Hay VUR abierto en una pestaña del Chrome del usuario: se usa esa. Quien llama
+            # verifica la sesión (sesion_vigente, sin cupo) y solo pide ingresar si venció.
+            self.cliente.modo, self.cliente.driver, self.cliente._proceso = "conector", CONECTOR, None
+            CONECTOR.set_script_timeout(TIMEOUT_API)
+            self.log_hilo("VUR está abierto en una pestaña de su Chrome: se usará esa pestaña.")
+            return self.cliente, True
         return self.cliente, False
+
+    def _confirmar_modo_chrome(self):
+        """Antes de consultar: si no se ve VUR en el Chrome del usuario y el conector nunca se
+        instaló, lo explica y ofrece instalarlo (una vez por sesión del programa)."""
+        if (CONECTOR.conectado() or conector_conocido() or getattr(self, "_ventana_aparte_ok", False)
+                or (self.cliente and self.cliente.vivo())):
+            return True
+        respuesta = messagebox.askyesnocancel(
+            "VUR en su Chrome",
+            "No se detecta VUR abierto en su Chrome.\n\n"
+            "Para que el programa use una pestaña de su Chrome (sin abrir una ventana aparte) hay que "
+            "instalar una sola vez el «Conector VUR».\n\n"
+            "Sí: instalar el conector ahora.\n"
+            "No: continuar con una ventana de Chrome aparte.\n"
+            "Cancelar: no hacer nada.", parent=self.root)
+        if respuesta is None:
+            return False
+        if respuesta:
+            self._instalar_conector()
+            return False
+        self._ventana_aparte_ok = True
+        return True
 
     def _mostrar_vista(self, indice):
         (self.vista_tabla if indice == 0 else self.vista_log).tkraise()
@@ -3575,6 +3615,8 @@ class App:
             limpia = sugerida
             self.txt_una.delete(0, "end")
             self.txt_una.insert(0, limpia)
+        if not self._confirmar_modo_chrome():
+            return
         fila = pd.Series({"Matricula_Original": texto, "Matricula_Limpia": limpia})
         self.detener.clear()
         self._en_ejecucion(True)
@@ -3749,7 +3791,7 @@ class App:
         return not (self.hilo and self.hilo.is_alive())
 
     def iniciar(self):
-        if not self._validar_carga():
+        if not self._validar_carga() or not self._confirmar_modo_chrome():
             return
         self.detener.clear()
         self._forzar = self.forzar_vur.get()  # se lee aquí: las variables de Tk no se tocan desde el hilo
