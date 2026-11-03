@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.3-1"
+VERSION_APLICATIVO = "2026.11.3-2"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -670,6 +670,30 @@ def formatear_propietarios(propietarios):
     return "; ".join(partes)
 
 
+ZONAS_CATASTRALES = {"00": "RURAL", "01": "URBANO"}  # 02 a 99: corregimientos / centros poblados
+
+
+def zona_catastral(referencia):
+    """Zona deducida de la referencia catastral (número predial de 20 o 30 dígitos del IGAC):
+    dígitos 6-7 = zona (00 rural, 01 urbano, 02-99 corregimiento). '' si no se puede deducir."""
+    t = re.sub(r"\D", "", referencia or "")
+    if len(t) not in (20, 30):
+        return ""
+    zona = t[5:7]
+    return ZONAS_CATASTRALES.get(zona, f"CORREGIMIENTO / CENTRO POBLADO (zona {zona})")
+
+
+def tipo_predio(db):
+    """Tipo de predio de VUR; si VUR no lo trae, la zona según la referencia catastral (marcada como deducida)."""
+    tipo = (db.get("tipoPredio") or "").strip()
+    if tipo and normalizar(tipo) not in ("SIN INFORMACION", "NO REGISTRA"):
+        return tipo
+    zona = zona_catastral(db.get("referenciaCatastral"))
+    if zona:
+        return f"{zona} (según la referencia catastral; VUR no lo indica)"
+    return tipo
+
+
 def extraer_campos(db):
     """Columnas de datos básicos a partir del JSON de VUR."""
     props = db.get("propietarios") or []
@@ -686,7 +710,7 @@ def extraer_campos(db):
         "Departamento": (db.get("departamento") or {}).get("nombre", ""),
         "Municipio": ((db.get("municipio") or {}).get("nombre") or "").replace("\ufffd", "Ñ"),
         "Nupre": db.get("nupre") or "",
-        "Tipo_Predio": db.get("tipoPredio") or "",
+        "Tipo_Predio": tipo_predio(db),
         "Estado_Folio": db.get("estadoFolio") or "",
         "Fecha_Apertura_Folio": db.get("fechaAperturaFolio") or "",
         "Matriculas_Matriz": ", ".join(db.get("matriculasMatriz") or []),
@@ -3483,7 +3507,20 @@ class App:
         txt.pack(side="left", fill="both", expand=True)
         barra.pack(side="right", fill="y")
         txt.tag_configure("t", font=self.f_pequena_negrita, foreground=c["verde"], spacing1=14, spacing3=4)
-        for campo, titulo in (("Fuente", "Fuente del resultado"),
+        txt.tag_configure("n", foreground=c["texto_suave"])
+        txt.insert("end", "DATOS DEL PREDIO\n", "t")
+        for campo, nombre in (("Matricula_VUR", "Matrícula en VUR"), ("Departamento", "Departamento"),
+                              ("Municipio", "Municipio"), ("Direccion_Inmueble", "Dirección"),
+                              ("Tipo_Predio", "Tipo de predio"), ("Referencia_Catastral", "Referencia catastral"),
+                              ("Nupre", "NUPRE"), ("Estado_Folio", "Estado del folio"),
+                              ("Fecha_Apertura_Folio", "Apertura del folio"), ("Matriculas_Matriz", "Matrículas matriz"),
+                              ("Clasificacion_Municipio", "Clasificación del municipio"),
+                              ("Total_Propietarios", "Número de propietarios"),
+                              ("Fecha_Consulta", "Fecha de la consulta")):
+            txt.insert("end", f"{nombre}: ", "n")
+            txt.insert("end", f"{reg.get(campo, '') or '—'}\n")
+        for campo, titulo in (("Notas_Proceso", "Cómo se obtuvo el resultado"),
+                              ("Fuente", "Fuente del resultado"),
                               ("Motivos_Revision", "Por qué requiere revisión"),
                               ("Segunda_Pasada", "Segunda pasada"),
                               ("Propietarios_Actuales", "Propietarios actuales"),
@@ -3493,8 +3530,7 @@ class App:
                               ("Afectaciones_Valorizacion", "Afectaciones por valorización (no definen el paz y salvo)"),
                               ("Valorizacion_Otros_Entes", "Valorización municipal (informativa: no corresponde a la Gobernación)"),
                               ("Cadena_Revisada", "Cadena de matrices revisada"),
-                              ("Proyectos_Municipio", "Proyectos del municipio"),
-                              ("Notas_Proceso", "Notas del proceso")):
+                              ("Proyectos_Municipio", "Proyectos del municipio")):
             valor = str(reg.get(campo, "") or "—")
             if campo == "Cadena_Revisada":
                 valor = valor.replace(" -> ", "\n→ ")
@@ -4600,6 +4636,16 @@ def ejecutar_autopruebas():
                 self.assertIn("TUVO VALORIZACIÓN", fila["Resultado"])
                 validacion = ws.data_validations.dataValidation[0]
                 self.assertIn("Correcto,Incorrecto,Duda", validacion.formula1)
+
+    class TipoPredio(unittest.TestCase):
+        def test_zona_desde_la_referencia_catastral(self):
+            self.assertEqual(v.zona_catastral("054000001000000020428000000000"), "RURAL")   # 017-45587 (La Unión)
+            self.assertEqual(v.zona_catastral("05001010100000010001"), "URBANO")
+            self.assertIn("CORREGIMIENTO", v.zona_catastral("05001020100000010001"))
+            self.assertEqual(v.zona_catastral("12345"), "")
+            self.assertIn("RURAL (según la referencia catastral",
+                          v.tipo_predio({"tipoPredio": "Sin información", "referenciaCatastral": "054000001000000020428000000000"}))
+            self.assertEqual(v.tipo_predio({"tipoPredio": "URBANO", "referenciaCatastral": "054000001000000020428000000000"}), "URBANO")
 
     class Comparacion(unittest.TestCase):
         def _excel(self, d, nombre, regs):
