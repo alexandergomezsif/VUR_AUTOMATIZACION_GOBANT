@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.3-4"
+VERSION_APLICATIVO = "2026.11.11-1"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1103,10 +1103,20 @@ def instalar_actualizacion(log=lambda m: None):
 # la página de inicio). El programa solo acepta mensajes de esa extensión.
 
 PUERTO_CONECTOR = 47321
-VERSION_CONECTOR = "1.0.0"
+VERSION_CONECTOR = "1.1.0"
 ID_CONECTOR = "ibjeklednnnddapcoiinbpeihhoabbpe"   # fijo, derivado de la clave pública del manifiesto
 CARPETA_CONECTOR = CARPETA_USUARIO / "conector_chrome"
-LATIDO_CONECTOR_S = 45   # si la pestaña de VUR no se reporta en este tiempo, se da por cerrada
+LATIDO_CONECTOR_S = 45   # si ninguna pestaña de VUR se reporta en este tiempo, se da por cerrada
+# Espera larga de cada sondeo. Chrome termina el proceso de fondo de una extensión cuando una
+# petición tarda más de 30 s en responder; con 10 s queda margen y no se pierde el trabajo.
+SONDEO_CONECTOR_S = 10
+# Si la pestaña a la que se le entregó un trabajo no lo acepta en este tiempo (Chrome la
+# descartó, congeló, recargó o cerró), el trabajo pasa a otra pestaña.
+ACEPTACION_CONECTOR_S = 6
+REASIGNACIONES_CONECTOR = 3
+# Una pestaña oculta solo recibe trabajo si no hay una visible reportándose: Chrome limita
+# a las pestañas de fondo, y es más probable que las descarte o las congele.
+PREFERENCIA_VISIBLE_S = 10
 
 EXTENSION_CHROME = {
     "manifest.json": """{
@@ -1124,46 +1134,75 @@ EXTENSION_CHROME = {
 """,
     "background.js": """// Puente entre la pestaña de VUR (content.js) y el programa local (127.0.0.1).
 const PROGRAMA = "http://127.0.0.1:PUERTO_CONECTOR";
-chrome.runtime.onMessage.addListener((mensaje, _remitente, responder) => {
-  const ruta = mensaje.tipo === "resultado" ? "/resultado" : "/sondeo";
+const pestanaDe = {};   // id de pestaña de Chrome -> identificador que usa content.js
+const avisar = (ruta, datos) => fetch(PROGRAMA + ruta, {method: "POST", headers: {"Content-Type": "application/json"},
+                                                      body: JSON.stringify(datos)}).catch(() => {});
+chrome.runtime.onMessage.addListener((mensaje, remitente, responder) => {
+  const ruta = {sondeo: "/sondeo", acepto: "/acepto", resultado: "/resultado", adios: "/adios"}[mensaje.tipo] || "/sondeo";
+  const idPestana = remitente.tab && remitente.tab.id;
+  if (idPestana !== undefined && mensaje.pestana) pestanaDe[idPestana] = mensaje.pestana;
   fetch(PROGRAMA + ruta, {method: "POST", headers: {"Content-Type": "application/json"},
                           body: JSON.stringify(mensaje)})
     .then(r => r.status === 200 ? r.json() : {})
-    .then(responder)
+    .then(async respuesta => {
+      if (respuesta.trabajo && idPestana !== undefined) {
+        // Si Chrome cerró, descartó o congeló la pestaña mientras esperaba, el trabajo no se
+        // puede hacer aquí: se devuelve enseguida para que otra pestaña lo tome.
+        let viva = true;
+        try { const t = await chrome.tabs.get(idPestana); viva = !(t.discarded || t.frozen); } catch (e) { viva = false; }
+        if (!viva) {
+          avisar("/devuelvo", {id: respuesta.trabajo.id, pestana: mensaje.pestana, motivo: "pestaña no disponible"});
+          return;
+        }
+      }
+      responder(respuesta);
+    })
     .catch(() => responder({error: "programa_cerrado"}));
   return true;  // la respuesta llega después (consulta en espera)
+});
+chrome.tabs.onRemoved.addListener(idPestana => {
+  if (pestanaDe[idPestana]) { avisar("/adios", {pestana: pestanaDe[idPestana]}); delete pestanaDe[idPestana]; }
 });
 """,
     "content.js": """// Corre dentro de cada pestaña de VUR. Pide trabajo al programa y lo hace con la sesión
 // de esta pestaña. Solo sabe: consultar direcciones de VUR y abrir otra página de VUR.
 (async function () {
   const version = chrome.runtime.getManifest().version;
+  const pestana = Math.random().toString(36).slice(2, 10);   // identifica esta carga de la pestaña
   const esperar = ms => new Promise(r => setTimeout(r, ms));
-  const enviar = m => chrome.runtime.sendMessage(m).catch(e => ({error: String(e)}));
+  const enviar = m => chrome.runtime.sendMessage(Object.assign({pestana}, m)).catch(e => ({error: String(e)}));
   const esDeVur = u => { try { return new URL(u).hostname.endsWith("vur.gov.co"); } catch (e) { return false; } };
+  async function traer(url) {   // una consulta a VUR con tope de tiempo: la pestaña siempre responde
+    const control = new AbortController();
+    const tope = setTimeout(() => control.abort(), 60000);
+    try {
+      const r = await fetch(url, {credentials: "include", signal: control.signal});
+      return {status: r.status, url: r.url, tipo: r.headers.get("content-type") || "", texto: await r.text()};
+    } catch (e) { return {error: String(e)}; }
+    finally { clearTimeout(tope); }
+  }
   async function consultar(urls, limite) {
     const res = new Array(urls.length);
     let siguiente = 0;
     async function trabajador() {
       while (siguiente < urls.length) {
         const k = siguiente++;
-        if (!esDeVur(urls[k])) { res[k] = {error: "dirección no permitida"}; continue; }
-        try {
-          const r = await fetch(urls[k], {credentials: "include"});
-          res[k] = {status: r.status, url: r.url, tipo: r.headers.get("content-type") || "", texto: await r.text()};
-        } catch (e) { res[k] = {error: String(e)}; }
+        res[k] = esDeVur(urls[k]) ? await traer(urls[k]) : {error: "dirección no permitida"};
       }
     }
     await Promise.all(Array.from({length: Math.max(1, Math.min(limite || 1, urls.length))}, trabajador));
     return res;
   }
   while (true) {
-    const r = await enviar({tipo: "sondeo", url: location.href, version});
+    const r = await enviar({tipo: "sondeo", url: location.href, version,
+                            visible: document.visibilityState === "visible"});
     if (!r || r.error) { await esperar(4000); continue; }   // programa cerrado: se reintenta
     const t = r.trabajo;
     if (!t) continue;
+    await enviar({tipo: "acepto", id: t.id});   // si esto no llega, el programa se lo da a otra pestaña
     if (t.tipo === "navegar" && esDeVur(t.url)) {
       await enviar({tipo: "resultado", id: t.id, datos: "ok"});
+      await enviar({tipo: "adios"});   // esta carga termina; la página nueva se reporta con otro identificador
       location.href = t.url;   // la página nueva vuelve a cargar este script
       return;
     }
@@ -1216,9 +1255,11 @@ class ConectorChrome:
         self._resultados = {}
         self._lock = threading.Lock()
         self._siguiente = 0
+        self._pestanas = {}          # id de carga de pestaña -> {latido, visible, url}
         self.ultimo_latido = None
         self.url_actual = ""
         self.version_extension = ""
+        self.avisar = lambda mensaje: None   # el programa pone aquí su registro
         self.timeout = TIMEOUT_API
         self.switch_to = self.service = _NoHace()
         self._servidor = None
@@ -1267,37 +1308,114 @@ class ConectorChrome:
 
     def _atender(self, ruta, mensaje):
         import time
+        pestana = str(mensaje.get("pestana") or "")   # vacío con la extensión 1.0.0
         if ruta == "/sondeo":
-            self.ultimo_latido = time.time()
-            self.url_actual = str(mensaje.get("url") or "")
-            self.version_extension = str(mensaje.get("version") or "")
+            ahora = time.time()
+            visible = bool(mensaje.get("visible", True))
+            with self._lock:
+                self.ultimo_latido = ahora
+                self.url_actual = str(mensaje.get("url") or "")
+                self.version_extension = str(mensaje.get("version") or "")
+                if pestana:
+                    self._pestanas[pestana] = {"latido": ahora, "visible": visible, "url": self.url_actual}
+                    for clave in [k for k, p in self._pestanas.items() if ahora - p["latido"] > LATIDO_CONECTOR_S]:
+                        del self._pestanas[clave]
+            if pestana and not visible and self._hay_visible():
+                time.sleep(min(PREFERENCIA_VISIBLE_S, SONDEO_CONECTOR_S))   # cede el trabajo a la visible
+                return {}
             try:
-                return {"trabajo": self._trabajos.get(timeout=20)}   # espera larga: respuesta inmediata
+                trabajo = self._trabajos.get(timeout=SONDEO_CONECTOR_S)   # espera larga: respuesta inmediata
             except queue.Empty:
                 return {}
+            with self._lock:
+                espera = self._resultados.get(trabajo["id"])
+                if not espera:
+                    return {}                     # ya se resolvió o se desistió
+                espera["asignado"] = time.time()
+                espera["pestana"] = pestana
+                espera["aceptado"] = not pestana  # la extensión antigua no confirma: se da por aceptado
+            return {"trabajo": trabajo}
+        if ruta == "/acepto":
+            with self._lock:
+                espera = self._resultados.get(mensaje.get("id"))
+                if espera and espera.get("pestana") == pestana:
+                    espera["aceptado"] = True
+            return {}
+        if ruta == "/devuelvo":   # la extensión avisa que la pestaña a la que iba el trabajo ya no sirve
+            with self._lock:
+                espera = self._resultados.get(mensaje.get("id"))
+                devolver = bool(espera and espera.get("pestana") == pestana and not espera["aceptado"]
+                                and espera["asignado"])
+                if devolver:
+                    espera["asignado"], espera["pestana"] = None, ""
+                    espera["reasignaciones"] += 1
+                    trabajo = espera["trabajo"]
+            if devolver:
+                self.avisar(f"Conector: {mensaje.get('motivo') or 'pestaña no disponible'}; la consulta pasa a otra "
+                            "pestaña.")
+                self._trabajos.put(trabajo)
+            return {}
+        if ruta == "/adios":      # la pestaña se cerró: deja de contar
+            with self._lock:
+                self._pestanas.pop(pestana, None)
+            return {}
         if ruta == "/resultado":
             with self._lock:
                 espera = self._resultados.get(mensaje.get("id"))
-            if espera:
+            if espera and not espera["listo"].is_set():   # el primero en responder gana
                 espera["datos"] = mensaje.get("datos")
                 espera["listo"].set()
             return {}
         return {}
+
+    def _hay_visible(self):
+        import time
+        ahora = time.time()
+        with self._lock:
+            return any(p["visible"] and ahora - p["latido"] < PREFERENCIA_VISIBLE_S for p in self._pestanas.values())
+
+    def pestanas(self):
+        """(pestañas de VUR reportándose, de ellas visibles)."""
+        import time
+        ahora = time.time()
+        with self._lock:
+            vivas = [p for p in self._pestanas.values() if ahora - p["latido"] < LATIDO_CONECTOR_S]
+        return len(vivas), sum(1 for p in vivas if p["visible"])
 
     def conectado(self):
         import time
         return bool(self.ultimo_latido) and time.time() - self.ultimo_latido < LATIDO_CONECTOR_S
 
     def _encargar(self, trabajo, timeout=None):
+        """Entrega un trabajo a una pestaña y espera el resultado. Si la pestaña que lo recibió no lo
+        acepta a tiempo (Chrome la descartó, congeló, recargó o cerró), se lo pasa a otra."""
+        import time
         with self._lock:
             self._siguiente += 1
             trabajo["id"] = self._siguiente
-            espera = self._resultados[trabajo["id"]] = {"listo": threading.Event(), "datos": None}
+            espera = self._resultados[trabajo["id"]] = {"listo": threading.Event(), "datos": None, "asignado": None,
+                                                        "aceptado": False, "pestana": "", "reasignaciones": 0,
+                                                        "trabajo": trabajo}
         self._trabajos.put(trabajo)
+        limite = time.time() + (timeout or self.timeout)
         try:
-            if not espera["listo"].wait(timeout or self.timeout):
-                raise TimeoutException("La pestaña de VUR no respondió a tiempo (¿se cerró?).")
-            return espera["datos"]
+            while True:
+                if espera["listo"].wait(0.5):
+                    return espera["datos"]
+                with self._lock:
+                    asignado, aceptado, veces = espera["asignado"], espera["aceptado"], espera["reasignaciones"]
+                if asignado and not aceptado and time.time() - asignado > ACEPTACION_CONECTOR_S:
+                    if veces >= REASIGNACIONES_CONECTOR:
+                        raise TimeoutException("Ninguna pestaña de VUR tomó la consulta (¿se cerraron o Chrome "
+                                               "las suspendió?).")
+                    with self._lock:
+                        espera["asignado"], espera["pestana"] = None, ""
+                        espera["reasignaciones"] += 1
+                    self.avisar(f"Conector: una pestaña de VUR no tomó la consulta; se pasa a otra "
+                                f"(intento {veces + 2}).")
+                    self._trabajos.put(trabajo)
+                if time.time() > limite:
+                    raise TimeoutException("La pestaña de VUR no respondió a tiempo (¿se cerró o VUR está lento?).")
         finally:
             with self._lock:
                 self._resultados.pop(trabajo["id"], None)
@@ -1330,9 +1448,12 @@ class ConectorChrome:
         else:
             self._encargar({"tipo": "navegar", "url": url}, timeout=30)
         limite = time.time() + 60
-        antes = self.ultimo_latido
-        while time.time() < limite:   # espera a que la página nueva se reporte
-            if self.conectado() and self.ultimo_latido != antes:
+        with self._lock:
+            conocidas, antes = set(self._pestanas), self.ultimo_latido
+        while time.time() < limite:   # espera a que la página nueva (carga nueva) se reporte
+            with self._lock:
+                nueva = any(k not in conocidas for k in self._pestanas)
+            if self.conectado() and (nueva or (not conocidas and self.ultimo_latido != antes)):
                 return
             time.sleep(0.25)
 
@@ -1389,6 +1510,7 @@ class VURClient:
         if CONECTOR.conectado() or conector_conocido():
             self.modo = "conector"
             self.driver = CONECTOR
+            CONECTOR.avisar = self.log
             if not CONECTOR.conectado():
                 self.log("Abriendo VUR en una pestaña de su Chrome (conector)...")
                 CONECTOR.get(URL_INICIO)
@@ -3180,7 +3302,12 @@ class App:
             if not ocupado and not en_uso:
                 if CONECTOR.conectado():
                     if self.semaforo.estado in ("cerrada", "pestana"):
-                        self.semaforo.fijar("pestana")
+                        total, visibles = CONECTOR.pestanas()
+                        detalle = None
+                        if total > 1:
+                            detalle = (f"{total} pestañas de VUR abiertas ({visibles} visibles). Con una sola, "
+                                       "la conexión es más estable.")
+                        self.semaforo.fijar("pestana", detalle)
                 elif self.semaforo.estado == "pestana":
                     self.semaforo.fijar("cerrada")
             if CONECTOR.conectado():
@@ -3191,8 +3318,10 @@ class App:
                         < version_tupla(VERSION_CONECTOR) and not getattr(self, "_aviso_conector", False)):
                     self._aviso_conector = True
                     preparar_conector()
-                    messagebox.showinfo("Conector VUR", "Hay una versión nueva del conector. En chrome://extensions, "
-                                        "pulse el botón de recargar (flecha circular) de «Conector VUR».",
+                    messagebox.showinfo("Conector VUR", "Hay una versión nueva del conector "
+                                        f"({CONECTOR.version_extension} → {VERSION_CONECTOR}). Ya quedó copiada en su "
+                                        "carpeta.\n\n1. En chrome://extensions pulse el botón de recargar (flecha "
+                                        "circular) de «Conector VUR».\n2. Recargue con F5 las pestañas de VUR abiertas.",
                                         parent=self.root)
         finally:
             self.root.after(3000, self._revisar_conector)
@@ -3263,7 +3392,8 @@ class App:
             ("Histórico", str(self.historico.carpeta) if getattr(self, "historico", None) else "—"),
             ("Chrome", {"conector": "pestaña en su Chrome (conector)", "normal": "ventana aparte",
                         "prueba": "ventana aparte (modo de prueba)"}.get(getattr(self.cliente, "modo", ""), "cerrado")
-                       + (f" · conector {CONECTOR.version_extension} activo" if CONECTOR.conectado() else
+                       + (f" · conector {CONECTOR.version_extension} activo, {CONECTOR.pestanas()[0]} pestaña(s)"
+                          if CONECTOR.conectado() else
                           " · conector instalado" if conector_conocido() else " · conector no instalado")),
             ("Entorno", f"Python {platform.python_version()} · Selenium {selenium.__version__} · "
                         f"{platform.system()} {platform.release()}"),
@@ -3380,6 +3510,7 @@ class App:
             self.cliente.nueva_ejecucion()
             return self.cliente, self.semaforo.estado in ("activa", "inactiva", "pestana")
         self.cliente = VURClient(self.log_hilo, self._notificar_sesion)
+        CONECTOR.avisar = self.log_hilo
         if CONECTOR.conectado():
             # Hay VUR abierto en una pestaña del Chrome del usuario: se usa esa. Quien llama
             # verifica la sesión (sesion_vigente, sin cupo) y solo pide ingresar si venció.
@@ -5066,7 +5197,7 @@ def ejecutar_autopruebas():
                 with self.assertRaises(v.WebDriverException):
                     _ = c.window_handles
 
-                def extension_falsa():
+                def extension_falsa():   # como la 1.0.0: sin identificador de pestaña ni aceptación
                     for _ in range(2):
                         t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.0.0"}).get("trabajo")
                         if t:
@@ -5089,6 +5220,146 @@ def ejecutar_autopruebas():
                     c.execute_async_script("return 1")
                 hilo.join(5)
             finally:
+                c.detener()
+
+        def test_trabajo_pasa_a_otra_pestana_si_la_primera_no_lo_acepta(self):
+            import socket
+            import time
+            import urllib.request
+            with socket.socket() as libre:
+                libre.bind(("127.0.0.1", 0))
+                puerto = libre.getsockname()[1]
+            origen = "chrome-extension://prueba"
+            c = v.ConectorChrome(puerto=puerto, origen=origen)
+            avisos = []
+            c.avisar = avisos.append
+            self.assertTrue(c.iniciar())
+            v.ACEPTACION_CONECTOR_S, aceptacion = 0.5, v.ACEPTACION_CONECTOR_S
+            try:
+                def enviar(ruta, datos):
+                    q = urllib.request.Request(f"http://127.0.0.1:{puerto}{ruta}", data=json.dumps(datos).encode(),
+                                               headers={"Origin": origen, "Content-Type": "application/json"})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(q, timeout=25) as r:
+                        return json.loads(r.read())
+
+                recibidos = []
+
+                def pestana_que_muere():   # toma el trabajo y nunca lo acepta (descartada por Chrome)
+                    t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.1.0", "pestana": "muerta",
+                                           "visible": False}).get("trabajo")
+                    recibidos.append(("muerta", t and t["id"]))
+
+                def pestana_sana():
+                    time.sleep(1.2)   # entra después de que la primera ya tomó el trabajo
+                    for _ in range(3):
+                        t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.1.0", "pestana": "sana",
+                                               "visible": True}).get("trabajo")
+                        if t:
+                            recibidos.append(("sana", t["id"]))
+                            enviar("/acepto", {"id": t["id"], "pestana": "sana"})
+                            enviar("/resultado", {"id": t["id"], "pestana": "sana",
+                                                  "datos": [{"status": 200, "url": u, "tipo": "application/json",
+                                                             "texto": "{}"} for u in t["urls"]]})
+                            return
+                h1 = threading.Thread(target=pestana_que_muere, daemon=True)
+                h2 = threading.Thread(target=pestana_sana, daemon=True)
+                h1.start()
+                time.sleep(0.3)
+                h2.start()
+                r = c.execute_async_script(v.JS_FETCH, "https://www.vur.gov.co/a")
+                self.assertEqual(r["url"], "https://www.vur.gov.co/a")
+                h1.join(5)
+                h2.join(5)
+                self.assertEqual([quien for quien, _ in recibidos], ["muerta", "sana"])
+                self.assertEqual(len({i for _, i in recibidos}), 1)   # el mismo trabajo, reasignado
+                self.assertTrue(avisos and "no tomó la consulta" in avisos[0])
+                self.assertEqual(c.pestanas(), (2, 1))
+            finally:
+                v.ACEPTACION_CONECTOR_S = aceptacion
+                c.detener()
+
+        def test_trabajo_devuelto_por_la_extension_pasa_a_otra_pestana(self):
+            import socket
+            import time
+            import urllib.request
+            with socket.socket() as libre:
+                libre.bind(("127.0.0.1", 0))
+                puerto = libre.getsockname()[1]
+            origen = "chrome-extension://prueba"
+            c = v.ConectorChrome(puerto=puerto, origen=origen)
+            self.assertTrue(c.iniciar())
+            try:
+                def enviar(ruta, datos):
+                    q = urllib.request.Request(f"http://127.0.0.1:{puerto}{ruta}", data=json.dumps(datos).encode(),
+                                               headers={"Origin": origen, "Content-Type": "application/json"})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(q, timeout=25) as r:
+                        return json.loads(r.read())
+
+                def cerrada():   # el proceso de fondo recibe el trabajo, ve la pestaña cerrada y lo devuelve
+                    t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.1.0", "pestana": "cerrada"})["trabajo"]
+                    enviar("/devuelvo", {"id": t["id"], "pestana": "cerrada", "motivo": "pestaña no disponible"})
+                    enviar("/adios", {"pestana": "cerrada"})
+
+                def sana():
+                    time.sleep(0.8)
+                    t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.1.0", "pestana": "sana"})["trabajo"]
+                    enviar("/acepto", {"id": t["id"], "pestana": "sana"})
+                    enviar("/resultado", {"id": t["id"], "pestana": "sana", "datos": "ok"})
+                for f in (cerrada, sana):
+                    threading.Thread(target=f, daemon=True).start()
+                    time.sleep(0.2)
+                t0 = time.time()
+                self.assertEqual(c._encargar({"tipo": "navegar", "url": v.URL_INICIO}, timeout=10), "ok")
+                self.assertLess(time.time() - t0, v.ACEPTACION_CONECTOR_S)   # sin esperar los 6 s de aceptación
+                time.sleep(0.3)
+                self.assertEqual(c.pestanas(), (1, 1))   # la cerrada ya no cuenta
+            finally:
+                c.detener()
+
+        def test_pestana_oculta_cede_el_trabajo_a_la_visible(self):
+            import socket
+            import time
+            import urllib.request
+            with socket.socket() as libre:
+                libre.bind(("127.0.0.1", 0))
+                puerto = libre.getsockname()[1]
+            origen = "chrome-extension://prueba"
+            c = v.ConectorChrome(puerto=puerto, origen=origen)
+            self.assertTrue(c.iniciar())
+            v.PREFERENCIA_VISIBLE_S, preferencia = 1, v.PREFERENCIA_VISIBLE_S
+            try:
+                def enviar(ruta, datos):
+                    q = urllib.request.Request(f"http://127.0.0.1:{puerto}{ruta}", data=json.dumps(datos).encode(),
+                                               headers={"Origin": origen, "Content-Type": "application/json"})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(q, timeout=25) as r:
+                        return json.loads(r.read())
+
+                quien = []
+
+                def pestana(nombre, visible, inicio):
+                    time.sleep(inicio)
+                    for _ in range(4):
+                        try:
+                            t = enviar("/sondeo", {"url": v.URL_INICIO, "version": "1.1.0", "pestana": nombre,
+                                                   "visible": visible}).get("trabajo")
+                        except OSError:
+                            return   # la prueba ya terminó y apagó el puente
+                        if t:
+                            quien.append(nombre)
+                            enviar("/acepto", {"id": t["id"], "pestana": nombre})
+                            enviar("/resultado", {"id": t["id"], "pestana": nombre, "datos": "ok"})
+                            return
+                hilos = [threading.Thread(target=pestana, args=("visible", True, 0.0), daemon=True),
+                         threading.Thread(target=pestana, args=("oculta", False, 0.2), daemon=True)]
+                for h in hilos:
+                    h.start()
+                time.sleep(0.6)   # ambas ya se reportaron; la oculta está cediendo
+                c._encargar({"tipo": "navegar", "url": v.URL_INICIO}, timeout=10)
+                for h in hilos:
+                    h.join(8)
+                self.assertEqual(quien, ["visible"])
+            finally:
+                v.PREFERENCIA_VISIBLE_S = preferencia
                 c.detener()
 
     casos = [c for c in list(locals().values())

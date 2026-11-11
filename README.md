@@ -62,7 +62,13 @@ una pestaña de la ventana de Chrome que usted ya tiene abierta. Se instala una 
 El conector solo trabaja en páginas de `vur.gov.co` y solo habla con el propio equipo (`127.0.0.1`).
 No ejecuta código que le envíen: solo consulta direcciones de VUR y recarga la página de inicio.
 Si una actualización trae conector nuevo, el programa avisa: pulse el botón de recargar de
-«Conector VUR» en `chrome://extensions`.
+«Conector VUR» en `chrome://extensions` y recargue (F5) las pestañas de VUR.
+
+**Consejos para una conexión estable:** mantenga una sola pestaña de VUR (el indicador avisa si hay
+varias) y, en Chrome → Configuración → Rendimiento → Ahorro de memoria, agregue `vur.gov.co` a
+«Mantener siempre activos estos sitios», para que Chrome no descarte la pestaña mientras el programa
+trabaja. Si una pestaña deja de responder, el programa pasa la consulta a otra pestaña en pocos
+segundos (y lo anota en el registro del proceso).
 
 ## Carpetas en el equipo
 
