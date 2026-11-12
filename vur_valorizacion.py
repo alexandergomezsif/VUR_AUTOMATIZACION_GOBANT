@@ -135,7 +135,8 @@ COLUMNAS_SALIDA = [
 COLUMNAS_VISIBLES = [
     "Matricula_Original", "Resultado", "Confiabilidad", "Motivos_Revision", "Estado", "Ente_Valorizacion",
     "Matricula_Con_Anotacion", "Nivel_Matriz", "Matricula_Cancelacion", "Propietario_Gravado",
-    "Propietarios_Actuales", "Municipio", "Propietario", "Tipo_Identificacion", "Numero_Identificacion",
+    "Propietarios_Actuales", "Municipio", "Direccion_Inmueble", "Tipo_Predio", "Propietario", "Tipo_Identificacion",
+    "Numero_Identificacion",
     "Observaciones", "Afectaciones_Valorizacion", "Valorizacion_Otros_Entes", "Cadena_Revisada",
     "Folios_Revisados", "Intentos",
     "Fuente", "Fecha_Consulta",
@@ -144,7 +145,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.12-2"
+VERSION_APLICATIVO = "2026.11.12-3"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -2043,7 +2044,8 @@ def exportar_excel(registros, ruta, duracion=""):
     anchos = {"Observaciones": 80, "Cadena_Revisada": 60, "Detalle_Valorizacion": 50,
               "Propietarios_Actuales": 45, "Propietario_Gravado": 40, "Notas_Proceso": 50,
               "Proyectos_Municipio": 45, "Motivos_Revision": 55, "Afectaciones_Valorizacion": 60,
-              "Resultado": 46, "Estado": 22, "Propietario": 28, "Municipio": 18}
+              "Resultado": 46, "Estado": 22, "Propietario": 28, "Municipio": 18, "Direccion_Inmueble": 30,
+              "Tipo_Predio": 16}
     for i, col in enumerate(COLUMNAS_EXCEL, 1):
         ws.column_dimensions[get_column_letter(i)].width = anchos.get(col, max(12, len(col) + 2))
         # Los textos largos (anotaciones completas, cadena...) no se ajustan: harían filas
@@ -2130,7 +2132,8 @@ def _hoja_resumen(wb, registros, duracion=""):
 
 
 COLUMNAS_REVISION = [  # (columna de resultados o None, encabezado, ancho)
-    ("Matricula_Limpia", "Matrícula", 14), ("Municipio", "Municipio", 16), ("Resultado", "Resultado", 40),
+    ("Matricula_Limpia", "Matrícula", 14), ("Municipio", "Municipio", 16), ("Direccion_Inmueble", "Dirección", 28),
+    ("Resultado", "Resultado", 40),
     ("Motivos_Revision", "Por qué revisar", 45), ("Ente_Valorizacion", "Ente", 14),
     ("Matricula_Con_Anotacion", "Folio con la anotación", 14), ("Nivel_Matriz", "Nivel de matriz", 8),
     ("Matricula_Cancelacion", "Folio de la cancelación", 14),
