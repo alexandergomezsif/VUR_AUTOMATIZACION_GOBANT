@@ -134,8 +134,8 @@ COLUMNAS_SALIDA = [
 # columnas). No se elimina: lo usan el histórico, "Comparar" y la trazabilidad.
 COLUMNAS_VISIBLES = [
     "Matricula_Original", "Resultado", "Confiabilidad", "Motivos_Revision", "Estado", "Ente_Valorizacion",
-    "Matricula_Con_Anotacion", "Nivel_Matriz", "Matricula_Cancelacion", "Propietario_Gravado", "Municipio",
-    "Propietario", "Tipo_Identificacion", "Numero_Identificacion", "Propietarios_Actuales",
+    "Matricula_Con_Anotacion", "Nivel_Matriz", "Matricula_Cancelacion", "Propietario_Gravado",
+    "Propietarios_Actuales", "Municipio", "Propietario", "Tipo_Identificacion", "Numero_Identificacion",
     "Observaciones", "Afectaciones_Valorizacion", "Valorizacion_Otros_Entes", "Cadena_Revisada",
     "Folios_Revisados", "Intentos",
     "Fuente", "Fecha_Consulta",
@@ -144,7 +144,7 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.12-1"
+VERSION_APLICATIVO = "2026.11.12-2"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
@@ -1953,9 +1953,11 @@ ESTILO_ESTADO = {
 
 
 CONCLUSIONES = {
-    "GRAVADA": "TIENE VALORIZACIÓN {tipo} VIGENTE",
-    "GRAVAMEN CANCELADO": "TUVO VALORIZACIÓN {tipo}, YA CANCELADA",
-    "NO GRAVADA": "NO TIENE VALORIZACIÓN DEPARTAMENTAL NI INVIAS",
+    # Redacción pedida por el área (12/11/2026): el programa no juzga si está pagada; informa que
+    # se valorizó, si se canceló y a quién, y los profesionales deciden el paz y salvo.
+    "GRAVADA": "VALORIZADA ({tipo})",
+    "GRAVAMEN CANCELADO": "VALORIZADA Y CANCELADA ({tipo})",
+    "NO GRAVADA": "NO VALORIZADA (DEPARTAMENTAL NI INVIAS)",
     ESTADO_INCOMPLETO: "NO SE HALLÓ VALORIZACIÓN, PERO LA REVISIÓN DE MATRICES QUEDÓ INCOMPLETA",
     "SIN DATOS EN VUR": "NO SE PUDO CONSULTAR (VUR SIN DATOS)",
     "ERROR": "NO SE PUDO CONSULTAR (ERROR)",
@@ -2134,7 +2136,7 @@ COLUMNAS_REVISION = [  # (columna de resultados o None, encabezado, ancho)
     ("Matricula_Cancelacion", "Folio de la cancelación", 14),
     ("Detalle_Valorizacion", "Anotación de valorización", 60),
     ("Valorizacion_Otros_Entes", "Valorización de otros entes (informativa)", 45),
-    ("Propietario_Gravado", "Propietario gravado", 35),
+    ("Propietario_Gravado", "Propietario gravado", 35), ("Propietarios_Actuales", "Propietarios actuales", 35),
     (None, "Veredicto del revisor", 14), (None, "Observación del revisor", 45),
     (None, "Revisado por", 18), (None, "Fecha de revisión", 12),
 ]
@@ -4854,7 +4856,7 @@ def ejecutar_autopruebas():
                 fila = dict(zip(encabezado, [c.value for c in ws[2]]))
                 self.assertEqual((fila["Matrícula"], fila["Folio con la anotación"], fila["Nivel de matriz"]),
                                  ("020-1", "020-9", "2"))
-                self.assertIn("TUVO VALORIZACIÓN", fila["Resultado"])
+                self.assertIn("VALORIZADA Y CANCELADA", fila["Resultado"])
                 validacion = ws.data_validations.dataValidation[0]
                 self.assertIn("Correcto,Incorrecto,Duda", validacion.formula1)
 
@@ -4912,12 +4914,13 @@ def ejecutar_autopruebas():
             r = consultar(db, ej, "025", "41332")
             self.assertEqual((r["Estado"], r["Matricula_Con_Anotacion"], r["Nivel_Matriz"]), ("GRAVAMEN CANCELADO", "025-5759", 3))
             self.assertEqual(r["Ente_Valorizacion"], "DEPARTAMENTAL")
-            self.assertIn("TUVO VALORIZACIÓN DEPARTAMENTAL", v.conclusion(r))
+            self.assertIn("VALORIZADA Y CANCELADA (DEPARTAMENTAL)", v.conclusion(r))
+            self.assertIn("TITULAR FICTICIO", r["Propietarios_Actuales"])   # el propietario actual se informa aparte
             self.assertEqual(r["Afectaciones_Valorizacion"], "")
             # Si la cancelación no existiera, la matrícula saldría GRAVADA
             ej["025-5759"] = {"textoAnotaciones": [COMPRA, self.GRAV_6]}
             r = consultar(db, ej, "025", "41332")
-            self.assertEqual((r["Estado"], v.conclusion(r)[:35]), ("GRAVADA", "TIENE VALORIZACIÓN DEPARTAMENTAL VI"))
+            self.assertEqual((r["Estado"], v.conclusion(r)[:26]), ("GRAVADA", "VALORIZADA (DEPARTAMENTAL)"))
 
     class TipoPredio(unittest.TestCase):
         def test_zona_desde_la_referencia_catastral(self):
@@ -5029,10 +5032,10 @@ def ejecutar_autopruebas():
         """Pedido de los profesionales (27/10/2026): las primeras columnas deben ser concluyentes."""
 
         def test_conclusion(self):
-            self.assertEqual(v.conclusion({"Estado": "NO GRAVADA", "Confiabilidad": "ALTA"}), "NO TIENE VALORIZACIÓN DEPARTAMENTAL NI INVIAS")
+            self.assertEqual(v.conclusion({"Estado": "NO GRAVADA", "Confiabilidad": "ALTA"}), "NO VALORIZADA (DEPARTAMENTAL NI INVIAS)")
             t = v.conclusion({"Estado": "GRAVAMEN CANCELADO", "Matricula_Con_Anotacion": "01N-5052127",
                               "Nivel_Matriz": 3, "Confiabilidad": "REVISAR"})
-            self.assertEqual(t, "TUVO VALORIZACIÓN DEPARTAMENTAL, YA CANCELADA · anotación en la matriz 01N-5052127 (nivel 3)"
+            self.assertEqual(t, "VALORIZADA Y CANCELADA (DEPARTAMENTAL) · anotación en la matriz 01N-5052127 (nivel 3)"
                                 " · REQUIERE REVISIÓN MANUAL")
             self.assertIn("misma matrícula", v.conclusion({"Estado": "GRAVADA", "Matricula_Con_Anotacion": "008-1",
                                                             "Nivel_Matriz": 0}))
@@ -5048,7 +5051,7 @@ def ejecutar_autopruebas():
                 ws = wb["Resultados"]
                 encabezado = [c.value for c in ws[1]]
                 self.assertEqual(encabezado[:3], ["Matricula_Original", "Resultado", "Confiabilidad"])
-                self.assertEqual(ws["B2"].value, "TIENE VALORIZACIÓN DEPARTAMENTAL VIGENTE")
+                self.assertEqual(ws["B2"].value, "VALORIZADA (DEPARTAMENTAL)")
                 self.assertEqual(set(encabezado) - {"Resultado"}, set(v.COLUMNAS_SALIDA))  # no se pierde ninguna
                 oculta = openpyxl.utils.get_column_letter(len(v.COLUMNAS_VISIBLES) + 1)
                 self.assertTrue(any(dim.hidden and dim.min <= openpyxl.utils.column_index_from_string(oculta) <= dim.max
@@ -5216,7 +5219,7 @@ def ejecutar_autopruebas():
                           "024", "1")
             self.assertEqual((r["Estado"], r["Confiabilidad"], r["Ente_Valorizacion"]),
                              ("GRAVADA", "ALTA", "NACIONAL (INVIAS)"))
-            self.assertEqual(v.conclusion(r), "TIENE VALORIZACIÓN INVIAS VIGENTE · anotación en la misma matrícula"
+            self.assertEqual(v.conclusion(r), "VALORIZADA (INVIAS) · anotación en la misma matrícula"
                                               " · paz y salvo INVIAS (otro tipo)")
             r2 = consultar({"024-1": db_basico("SANTA FE DE ANTIOQUIA")},
                            {"024-1": {"textoAnotaciones": [COMPRA, inv, VAL_430]}}, "024", "1")
