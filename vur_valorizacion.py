@@ -144,11 +144,11 @@ COLUMNAS_EXCEL = COLUMNAS_VISIBLES + [c for c in COLUMNAS_SALIDA if c not in COL
 
 # Versión de las reglas de análisis. Se escribe en cada fila del Excel para saber
 # con qué reglas se obtuvo cada resultado.
-VERSION_APLICATIVO = "2026.11.11-1"
+VERSION_APLICATIVO = "2026.11.12-1"
 # Versión de las REGLAS de análisis. Se cambia solo cuando cambia cómo se clasifica una
 # matrícula; así los resultados guardados en el histórico con reglas anteriores no se
 # reutilizan y se vuelven a consultar. Los cambios de pantalla no la modifican.
-VERSION_REGLAS = "2026.11.3-1"
+VERSION_REGLAS = "2026.11.12-1"
 
 # Confiabilidad de cada resultado:
 #   ALTA    -> todo lo que sustenta el estado viene explícito en VUR.
@@ -382,6 +382,13 @@ def _menciona_valorizacion(anotacion):
     return any(normalizar(p) in espec for p in PALABRAS_VALORIZACION)
 
 
+def _naturaleza_gravamen(anotacion):
+    """True si VUR clasifica el acto como gravamen: '... (GRAVAMEN)' al final de la especificación
+    o NATURALEZA JURIDICA DEL ACTO: GRAVAMEN."""
+    espec = normalizar(anotacion["especificacion"])
+    return bool(re.search(r"\(GRAVAMEN\)\s*$", espec)) or normalizar(anotacion.get("naturaleza", "")).startswith("GRAVAMEN")
+
+
 def _menciona_afectacion(anotacion):
     texto = normalizar(anotacion["especificacion"] + " " + anotacion["naturaleza"])
     return "AFECTACION" in texto or "INENAJENAB" in texto or "MEDIDA CAUTELAR" in texto
@@ -394,10 +401,15 @@ def tipo_valorizacion(anotacion):
         return None
     if es_cancelacion(anotacion):
         return "cancelacion"
+    # Lo que VUR inscribe con código de gravamen (430/0212) o con naturaleza "(GRAVAMEN)" es un
+    # gravamen aunque el texto diga "afectación" o "medida cautelar": p. ej. "430 AFECTACION POR
+    # VALORIZACION MEDIDA CAUTELAR (GRAVAMEN)" en 025-5759 (fallo del 12/11/2026: se informaba
+    # como afectación y la matrícula salía NO GRAVADA). La afectación informativa es la de
+    # inenajenabilidad (código 380, naturaleza "medida cautelar").
+    if _codigo(anotacion["especificacion"]) in CODIGOS_GRAVAMEN_VALORIZACION or _naturaleza_gravamen(anotacion):
+        return "gravamen"
     if _menciona_afectacion(anotacion):
         return "afectacion"
-    if _codigo(anotacion["especificacion"]) in CODIGOS_GRAVAMEN_VALORIZACION:
-        return "gravamen"
     # 999 = "OTRO": código genérico de VUR para actos de la tabla antigua, p. ej.
     # "999 GRAVAMEN DE VALORIZACION (430) (OTRO)" (001-77175). Si el texto dice que es un
     # gravamen, es un gravamen normal (revisión del funcionario del 03/11/2026).
@@ -493,22 +505,51 @@ def analizar_folio(anotaciones):
 ENTE_DEPARTAMENTAL, ENTE_MUNICIPAL, ENTE_NACIONAL, ENTE_DESCONOCIDO = (
     "DEPARTAMENTAL", "MUNICIPAL", "NACIONAL", "SIN IDENTIFICAR")
 _ENTES = (
+    # "VALORIZACION MUNICIPAL" (p. ej. la de Medellín) va antes, porque su nombre antiguo también
+    # era "Departamento Administrativo de Valorización Municipal".
+    (ENTE_MUNICIPAL, re.compile(r"VALORIZACION MUNICIPAL")),
+    # El "Departamento Administrativo de Valorización" (sin "municipal") era la entidad de
+    # valorización de la Gobernación de Antioquia (025-5759, res. 1114 de 1997 = proyecto 005).
     (ENTE_DEPARTAMENTAL, re.compile(r"DEPARTAMENTO DE ANTIOQUIA|GOBERNACION|GOB\.? ?ANTIOQUIA|DEPARTAMENTAL|DEPTAL"
-                                    r"|DEPTO\.? ?(ADMI|ADTIVO|ADMTIVO)|890\.?900\.?286")),
+                                    r"|DEPTO\.? ?(ADMI|ADTIVO|ADMTIVO)|DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION"
+                                    r"|890\.?900\.?286")),
     (ENTE_MUNICIPAL, re.compile(r"MUNICIPIO|MUNICIPAL|ALCALDIA|\bMPL\b|IMPES")),
     (ENTE_NACIONAL, re.compile(r"INVIAS|INSTITUTO NACIONAL DE VIAS|NACION\b")),
 )
 
 
 def ente_valorizacion(anotacion):
-    """Ente de una anotación: primero por quién la inscribe (DE:), luego por el documento."""
+    """Ente de una anotación: primero por quién la inscribe (DE:), luego por el documento y, si
+    sigue sin identificarse, por la resolución: si coincide con un proyecto de la Gobernación en
+    el municipio consultado, es departamental (queda anotado en 'ente_evidencia')."""
     doc = re.search(r"Doc:\s*(.*)", anotacion.get("texto", ""))
     for fuente in (" | ".join(anotacion.get("de") or []), doc.group(1) if doc else ""):
         texto = normalizar(fuente)
         for ente, patron in _ENTES:
             if texto and patron.search(texto):
                 return ente
+    proyecto = proyecto_por_resolucion(anotacion.get("municipio_consulta"), doc.group(1) if doc else "")
+    if proyecto:
+        anotacion["ente_evidencia"] = proyecto
+        return ENTE_DEPARTAMENTAL
     return ENTE_DESCONOCIDO
+
+
+def proyecto_por_resolucion(municipio, doc):
+    """'005 PTE GABINO - ... (res. 1114 de 1997)' si el documento cita una resolución y año que
+    coinciden con un proyecto de valorización de la Gobernación en ese municipio; si no, ''."""
+    if not municipio or not doc:
+        return ""
+    m = re.search(r"RESOLUCION\s*(?:N[O°.]*\s*)?(\d{1,6})\D{0,12}?((?:19|20)\d\d)", normalizar(doc))
+    if not m:
+        return ""
+    numero, anio = m.group(1).lstrip("0"), int(m.group(2))
+    _, _, info = clasificar_municipio(municipio)
+    for p in (info or {}).get("proyectos", []):
+        anio_p = p.get("anio") or (parsear_fecha(p.get("fecha_resolucion")) or date(1, 1, 1)).year
+        if str(p.get("resolucion") or "").lstrip("0") == numero and anio_p == anio:
+            return f"{p.get('codigo') or ''} {p.get('obra', '')} (res. {numero} de {anio})".strip()
+    return ""
 
 
 def separar_por_ente(analisis):
@@ -767,6 +808,7 @@ def revisar_cadena(api, circulo, numero, db_inicial, fecha_limite, log=lambda m:
     cancelaciones, matricula_cancelacion, cadena, niveles y notas.
     """
     cola = deque([(circulo, numero, db_inicial, 0)])
+    municipio_consulta = ((db_inicial or {}).get("municipio") or {}).get("nombre") or ""
     vistos = {f"{circulo}-{numero}"}
     cadena, notas = [], []
     folios = 0
@@ -801,6 +843,8 @@ def revisar_cadena(api, circulo, numero, db_inicial, fecha_limite, log=lambda m:
             notas.append(f"{etiqueta}: VUR no devolvió el estado jurídico (dos intentos)")
             incompleta = True
         anotaciones = [parsear_anotacion(t) for t in (ej or {}).get("textoAnotaciones") or []]
+        for a in anotaciones:
+            a["municipio_consulta"] = municipio_consulta   # para reconocer el ente por la resolución del proyecto
         anotaciones_por_folio[etiqueta] = anotaciones
         datos_por_folio[etiqueta] = db
         analisis, otras = separar_por_ente(analizar_folio(anotaciones))
@@ -4341,6 +4385,9 @@ class App:
             if ente_valorizacion(a) == ENTE_DESCONOCIDO:
                 motivos.append(f"Anotación {a['nro']}: no se identificó si la valorización es departamental "
                                "(se tomó como departamental por precaución)")
+            elif a.get("ente_evidencia"):
+                notas.append(f"Anotación {a['nro']} de {r['matricula']}: departamental porque su resolución es la "
+                             f"del proyecto {a['ente_evidencia']} de la Gobernación")
             if tipo_valorizacion(a) == "dudosa":
                 motivos.append(f"Anotación {a['nro']}: código de valorización no reconocido ({_codigo(a['especificacion']) or 'sin código'})")
             textos.append(f"{r['matricula']} - {a['texto']}{marca}")
@@ -4820,6 +4867,57 @@ def ejecutar_autopruebas():
                 (Path(d) / "pythonw.exe").write_text("")
                 self.assertEqual(v.python_sin_consola(Path(d) / "python.exe"), Path(d) / "pythonw.exe")
                 self.assertIsNone(v.python_sin_consola(Path(d) / "pythonw.exe"))     # ya es pythonw
+
+    class Fallo121126(unittest.TestCase):
+        """025-0041332 (Carolina): el gravamen "430 AFECTACION POR VALORIZACION MEDIDA CAUTELAR
+        (GRAVAMEN)" de la matriz 025-5759 se informaba como afectación y la matrícula salía
+        NO GRAVADA; además su ente ("DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION", res. 1114 de
+        1997 = proyecto 005) quedaba SIN IDENTIFICAR. Textos reales del histórico del 10/11/2026."""
+        GRAV_6 = ("ANOTACION: Nro 6 Fecha: 26-09-1997 Radicación: 1625<br>Doc: RESOLUCION 1114 DEL 1997-08-11 00:00:00 "
+                  "VALORIZACION DE MEDELLIN VALOR ACTO: $<br/>ESPECIFICACION: 430 AFECTACION POR VALORIZACION MEDIDA "
+                  f"CAUTELAR (GRAVAMEN)<br/>{P}<br/>DE: DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION<br/>A: TITULAR FICTICIO X")
+        CANC_8 = ("ANOTACION: Nro 8 Fecha: 25-11-1998 Radicación: 2013<br>Doc: OFICIO 890 DEL 1998-11-10 00:00:00 "
+                  "VALORIZACION DE MEDELLIN VALOR ACTO: $<br>Se cancela anotación No: 6<br/>ESPECIFICACION: 780 "
+                  f"CANCELACION DE VALORIZACION (CANCELACION)<br/>{P}<br/>DE: DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION")
+
+        def test_430_con_naturaleza_gravamen_es_gravamen_aunque_diga_afectacion(self):
+            self.assertEqual(v.tipo_valorizacion(v.parsear_anotacion(self.GRAV_6)), "gravamen")
+            self.assertEqual(v.tipo_valorizacion(v.parsear_anotacion(AFECT)), "afectacion")   # 380 sigue informativa
+            self.assertEqual(folio([COMPRA, self.GRAV_6])["estado"], "GRAVADA")
+            self.assertEqual(folio([COMPRA, self.GRAV_6, self.CANC_8])["estado"], "GRAVAMEN CANCELADO")
+
+        def test_departamento_administrativo_de_valorizacion_es_la_gobernacion(self):
+            self.assertEqual(v.ente_valorizacion(v.parsear_anotacion(self.GRAV_6)), "DEPARTAMENTAL")
+            municipal = v.parsear_anotacion(an(1, "01-01-2000", "430 VALORIZACION (GRAVAMEN)",
+                                              ["DE: DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION MUNICIPAL"]))
+            self.assertEqual(v.ente_valorizacion(municipal), "MUNICIPAL")
+
+        def test_resolucion_del_proyecto_identifica_el_ente(self):
+            a = v.parsear_anotacion(self.GRAV_6.replace("DE: DEPARTAMENTO ADMINISTRATIVO DE VALORIZACION<br/>", ""))
+            self.assertEqual(v.ente_valorizacion(a), "SIN IDENTIFICAR")   # sin municipio no hay con qué comparar
+            a["municipio_consulta"] = "CAROLINA"
+            self.assertEqual(v.ente_valorizacion(a), "DEPARTAMENTAL")
+            self.assertIn("res. 1114 de 1997", a["ente_evidencia"])
+            self.assertEqual(v.proyecto_por_resolucion("CAROLINA", "RESOLUCION 9999 DEL 1997-08-11"), "")
+            self.assertEqual(v.proyecto_por_resolucion("CAROLINA", "RESOLUCION 1114 DEL 1990-08-11"), "")
+
+        def test_matricula_025_0041332_sube_a_la_matriz_y_encuentra_el_gravamen(self):
+            db = {"025-41332": dict(db_basico("CAROLINA", "01/10/2025", ["025-36505"]), circulo="025", numeroMatricula="41332"),
+                  "025-36505": dict(db_basico("CAROLINA", "14/07/2020", ["025-18739"]), circulo="025", numeroMatricula="36505"),
+                  "025-18739": dict(db_basico("CAROLINA", "16/06/1999", ["025-5759"]), circulo="025", numeroMatricula="18739"),
+                  "025-5759": dict(db_basico("CAROLINA", "11/03/1985"), circulo="025", numeroMatricula="5759")}
+            ej = {"025-41332": {"textoAnotaciones": [COMPRA]}, "025-36505": {"textoAnotaciones": [COMPRA]},
+                  "025-18739": {"textoAnotaciones": [COMPRA]},
+                  "025-5759": {"textoAnotaciones": [COMPRA, self.GRAV_6, self.CANC_8]}}
+            r = consultar(db, ej, "025", "41332")
+            self.assertEqual((r["Estado"], r["Matricula_Con_Anotacion"], r["Nivel_Matriz"]), ("GRAVAMEN CANCELADO", "025-5759", 3))
+            self.assertEqual(r["Ente_Valorizacion"], "DEPARTAMENTAL")
+            self.assertIn("TUVO VALORIZACIÓN DEPARTAMENTAL", v.conclusion(r))
+            self.assertEqual(r["Afectaciones_Valorizacion"], "")
+            # Si la cancelación no existiera, la matrícula saldría GRAVADA
+            ej["025-5759"] = {"textoAnotaciones": [COMPRA, self.GRAV_6]}
+            r = consultar(db, ej, "025", "41332")
+            self.assertEqual((r["Estado"], v.conclusion(r)[:35]), ("GRAVADA", "TIENE VALORIZACIÓN DEPARTAMENTAL VI"))
 
     class TipoPredio(unittest.TestCase):
         def test_zona_desde_la_referencia_catastral(self):
